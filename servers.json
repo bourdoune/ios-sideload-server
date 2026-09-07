@@ -1,0 +1,20 @@
+{
+    "servers": [
+        {
+            "name": "Local Anisette Server",
+            "address": "http://127.0.0.1:6970"
+        },
+        {
+            "name": "SideStore",
+            "address": "https://ani.sidestore.io"
+        },
+        {
+            "name": "WE. Studio",
+            "address": "https://anisette.wedotstud.io"
+        },
+        {
+            "name": "nythepegasus",
+            "address": "https://ani.npeg.us"
+        }
+    ]
+}

@@ -1,0 +1,37 @@
+# Python & Virtualenv
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+env/
+
+# Environment and secrets
+.env
+*.pem
+*.key
+*.p12
+*.cer
+*.crt
+
+# Apple profiles and certificates
+profiles/
+*.mobileprovision
+pairing_file.plist
+*.plist
+
+# IPAs and binaries
+*.ipa
+*.zip
+*.dbg
+installed_apps/
+AltServer
+sideloader
+zsign
+netmuxd
+
+# Runtime data & logs
+tg_config.json
+*.log
+.DS_Store
+static/icons/
