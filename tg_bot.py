@@ -68,7 +68,7 @@ async def answer_callback_query(session: aiohttp.ClientSession, callback_query_i
 
 async def get_device_status(session: aiohttp.ClientSession):
     try:
-        async with session.get(f"{LOCAL_API_BASE}/api/status", timeout=5) as resp:
+        async with session.get(f"{LOCAL_API_BASE}/api/status", timeout=15) as resp:
             if resp.status == 200:
                 return await resp.json()
     except Exception:
@@ -77,16 +77,23 @@ async def get_device_status(session: aiohttp.ClientSession):
 
 async def get_apps_list(session: aiohttp.ClientSession):
     try:
-        async with session.get(f"{LOCAL_API_BASE}/api/apps", timeout=5) as resp:
+        async with session.get(f"{LOCAL_API_BASE}/api/apps", timeout=15) as resp:
             if resp.status == 200:
                 return await resp.json()
     except Exception:
         pass
     return []
 
+async def set_device_ip(session: aiohttp.ClientSession, ip: str):
+    try:
+        async with session.post(f"{LOCAL_API_BASE}/api/set-ip", json={"ip": ip}, timeout=10) as resp:
+            return await resp.json()
+    except Exception as e:
+        return {"success": False, "message": str(e)}
+
 async def trigger_refresh_all(session: aiohttp.ClientSession):
     try:
-        async with session.post(f"{LOCAL_API_BASE}/api/refresh", timeout=25) as resp:
+        async with session.post(f"{LOCAL_API_BASE}/api/refresh", timeout=40) as resp:
             return await resp.json()
     except Exception as e:
         return {"success": False, "message": str(e)}
@@ -95,7 +102,7 @@ async def trigger_refresh_app(session: aiohttp.ClientSession, bundle_id: str):
     try:
         data = aiohttp.FormData()
         data.add_field("bundle_id", bundle_id)
-        async with session.post(f"{LOCAL_API_BASE}/api/refresh-app", data=data, timeout=20) as resp:
+        async with session.post(f"{LOCAL_API_BASE}/api/refresh-app", data=data, timeout=35) as resp:
             return await resp.json()
     except Exception as e:
         return {"success": False, "message": str(e)}
@@ -113,7 +120,10 @@ def format_status_message(status, apps):
         f"📦 <b>Installed Apps:</b>\n"
     )
     if not apps:
-        text += "<i>No sideloaded apps detected.</i>\n"
+        if not status.get("online"):
+            text += "<i>Device offline. If on SSTP VPN, unlock iPhone screen so iOS wakes the interface.</i>\n"
+        else:
+            text += "<i>No sideloaded apps detected.</i>\n"
     else:
         for app in apps:
             name = app.get("name", "Unknown")
@@ -170,16 +180,32 @@ async def handle_update(session: aiohttp.ClientSession, update: dict, config: di
             await send_tg_message(session, chat_id, reply_text, reply_markup=kb)
             
         elif text in ["/refresh", "refresh"]:
-            await send_tg_message(session, chat_id, "⏳ <i>Refreshing all apps over Wi-Fi...</i>")
+            await send_tg_message(session, chat_id, "⏳ <i>Refreshing all apps over Wi-Fi / VPN...</i>")
             res = await trigger_refresh_all(session)
             if res.get("success"):
                 await send_tg_message(session, chat_id, f"✅ {res.get('message', 'All apps refreshed!')}")
             else:
-                await send_tg_message(session, chat_id, f"❌ {res.get('message', 'Refresh failed')}")
+                msg = res.get('message', 'Refresh failed')
+                await send_tg_message(session, chat_id, f"❌ {msg}\n\n💡 <i>Ensure iPhone screen is unlocked so iOS wakes the VPN interface.</i>")
             # Send updated status
             status = await get_device_status(session)
             apps = await get_apps_list(session)
             await send_tg_message(session, chat_id, format_status_message(status, apps), reply_markup=get_main_keyboard(apps))
+
+        elif text.startswith("/ip"):
+            parts = text.strip().split()
+            if len(parts) > 1:
+                target_ip = parts[1]
+                res = await set_device_ip(session, target_ip)
+                if res.get("success"):
+                    st = "Online 🟢" if res.get("online") else "Offline 🔴"
+                    await send_tg_message(session, chat_id, f"✅ Device target IP set to <code>{target_ip}</code> ({st})\n\n💡 <i>Try /status or tap Refresh.</i>")
+                else:
+                    await send_tg_message(session, chat_id, f"❌ Failed to set IP: {res.get('message')}")
+            else:
+                status = await get_device_status(session)
+                cur_ip = status.get('ip', 'N/A') if status else 'N/A'
+                await send_tg_message(session, chat_id, f"ℹ️ Current target IP: <code>{cur_ip}</code>\n\nTo update your VPN IP:\n<code>/ip &lt;ip_address&gt;</code> (e.g. <code>/ip 172.16.3.33</code>)")
 
     elif "callback_query" in update:
         cb = update["callback_query"]
@@ -195,12 +221,13 @@ async def handle_update(session: aiohttp.ClientSession, update: dict, config: di
 
         elif data == "refresh_all":
             await answer_callback_query(session, cb_id, "Refreshing apps...")
-            await send_tg_message(session, chat_id, "⏳ <i>Refreshing all apps over Wi-Fi...</i>")
+            await send_tg_message(session, chat_id, "⏳ <i>Refreshing all apps over Wi-Fi / VPN...</i>")
             res = await trigger_refresh_all(session)
             if res.get("success"):
                 await send_tg_message(session, chat_id, f"✅ {res.get('message')}")
             else:
-                await send_tg_message(session, chat_id, f"❌ {res.get('message')}")
+                msg = res.get('message', 'Refresh failed')
+                await send_tg_message(session, chat_id, f"❌ {msg}\n\n💡 <i>Ensure iPhone screen is unlocked so iOS wakes the VPN interface.</i>")
             status = await get_device_status(session)
             apps = await get_apps_list(session)
             await send_tg_message(session, chat_id, format_status_message(status, apps), reply_markup=get_main_keyboard(apps))

@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from typing import Optional, List, Dict, Any
 
-from pymobiledevice3.lockdown import create_using_usbmux
+from pymobiledevice3.lockdown import create_using_usbmux, create_using_tcp
 from pymobiledevice3.services.installation_proxy import InstallationProxyService
 from pymobiledevice3.services.misagent import MisagentService
 
@@ -45,7 +45,41 @@ os.makedirs(ICONS_DIR, exist_ok=True)
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
-LAST_KNOWN_IP = os.getenv("DEVICE_IP", "127.0.0.1")
+DEVICE_IP_FILE = os.path.join(BASE_DIR, ".device_ip")
+
+def is_local_or_docker(ip: Optional[str]) -> bool:
+    if not ip:
+        return True
+    return (
+        ip.startswith("127.") or 
+        ip.startswith("172.17.") or 
+        ip.startswith("172.18.") or 
+        ip == "::1" or 
+        ip == "localhost"
+    )
+
+def load_last_known_ip() -> str:
+    if os.path.exists(DEVICE_IP_FILE):
+        try:
+            with open(DEVICE_IP_FILE, "r") as f:
+                ip = f.read().strip()
+                if ip and not is_local_or_docker(ip):
+                    return ip
+        except Exception:
+            pass
+    return os.getenv("DEVICE_IP", "127.0.0.1")
+
+def save_last_known_ip(ip: str):
+    if not ip or is_local_or_docker(ip):
+        return
+    try:
+        with open(DEVICE_IP_FILE, "w") as f:
+            f.write(ip.strip())
+    except Exception:
+        pass
+
+LAST_KNOWN_IP = load_last_known_ip()
+CURRENT_REGISTERED_NETMUXD_IP = None
 CACHED_APPS_LIST = []
 CACHED_APPS_TIMESTAMP = 0.0
 CACHED_DEVICE_PROPS = {}
@@ -106,9 +140,26 @@ def extract_and_save_app_icon(ipa_path: str, bundle_id: str) -> Optional[str]:
     return None
 APPS_CACHE_TTL = 30.0  # 30 seconds cache for snappy updates
 
-def is_device_alive(ip: str):
-    res = subprocess.run(["ping", "-c", "1", "-W", "1", ip], stdout=subprocess.DEVNULL)
-    return res.returncode == 0
+def is_device_alive(ip: str) -> bool:
+    """Check if device is reachable via TCP 62078 (Apple lockdown service) or ICMP ping."""
+    if not ip or is_local_or_docker(ip):
+        return False
+    # 1. Direct TCP probe to Apple lockdown port 62078 (works across Wi-Fi and VPN)
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.8)
+        ret = s.connect_ex((ip, 62078))
+        s.close()
+        if ret == 0:
+            return True
+    except Exception:
+        pass
+    # 2. Fallback to ICMP ping (works on home Wi-Fi)
+    try:
+        res = subprocess.run(["ping", "-c", "1", "-W", "1", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return res.returncode == 0
+    except Exception:
+        return False
 
 def is_device_in_netmuxd() -> bool:
     """Check if our device is already registered as an attached Network device."""
@@ -136,9 +187,11 @@ def is_device_in_netmuxd() -> bool:
     return False
 
 def register_device_to_netmuxd(ip: str):
-    """Tell netmuxd to attach the device by its IP directly, bypassing local mDNS broadcast limits."""
-    # Only send AddDevice if not already attached
-    if is_device_in_netmuxd():
+    """Tell netmuxd to attach the device by its IP directly, updating if IP changes."""
+    global CURRENT_REGISTERED_NETMUXD_IP
+    if not ip or is_local_or_docker(ip):
+        return
+    if CURRENT_REGISTERED_NETMUXD_IP == ip and is_device_in_netmuxd():
         return
     try:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -155,40 +208,44 @@ def register_device_to_netmuxd(ip: str):
         hdr = struct.pack("<IIII", len(data) + 16, 1, 8, 69)
         s.sendall(hdr + data)
         s.close()
+        CURRENT_REGISTERED_NETMUXD_IP = ip
     except Exception as e:
         print(f"Error registering device to netmuxd: {e}")
 
 async def get_lockdown_client():
-    """Connect to iPhone over netmuxd with auto-retry and direct IP registration."""
-    # Ensure netmuxd knows about device at LAST_KNOWN_IP if not already attached
-    if LAST_KNOWN_IP and not is_device_in_netmuxd():
+    """Connect to iPhone directly over TCP or via netmuxd with auto-retry."""
+    # 1. Try direct TCP connection first if IP is known (works great on SSTP VPN and LAN)
+    if LAST_KNOWN_IP and not is_local_or_docker(LAST_KNOWN_IP):
+        try:
+            return await asyncio.wait_for(
+                create_using_tcp(hostname=LAST_KNOWN_IP, identifier=DEVICE_UDID or None),
+                timeout=3.5
+            )
+        except Exception:
+            pass
+
+    # 2. Try netmuxd
+    if LAST_KNOWN_IP and not is_local_or_docker(LAST_KNOWN_IP):
         register_device_to_netmuxd(LAST_KNOWN_IP)
         await asyncio.sleep(0.2)
 
     try:
-        return await create_using_usbmux(serial=DEVICE_UDID, connection_type="Network")
+        return await asyncio.wait_for(
+            create_using_usbmux(serial=DEVICE_UDID, connection_type="Network"),
+            timeout=3.5
+        )
     except Exception:
-        # Re-register and retry
-        if LAST_KNOWN_IP:
+        # Re-register and retry once
+        if LAST_KNOWN_IP and not is_local_or_docker(LAST_KNOWN_IP):
             register_device_to_netmuxd(LAST_KNOWN_IP)
-            await asyncio.sleep(0.5)
+            await asyncio.sleep(0.4)
         try:
-            return await create_using_usbmux(serial=DEVICE_UDID, connection_type="Network")
+            return await asyncio.wait_for(
+                create_using_usbmux(serial=DEVICE_UDID, connection_type="Network"),
+                timeout=3.5
+            )
         except Exception:
-            # Re-trigger netmuxd restart if device dropped
-            sudo_pwd = os.getenv("SUDO_PASSWORD")
-            if sudo_pwd:
-                subprocess.run(["sudo", "-S", "systemctl", "restart", "netmuxd.service"], input=f"{sudo_pwd}\n".encode(), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            else:
-                subprocess.run(["systemctl", "restart", "netmuxd.service"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            await asyncio.sleep(1.0)
-            if LAST_KNOWN_IP:
-                register_device_to_netmuxd(LAST_KNOWN_IP)
-                await asyncio.sleep(0.3)
-            try:
-                return await create_using_usbmux(serial=DEVICE_UDID, connection_type="Network")
-            except Exception:
-                return None
+            return None
 
 def extract_ipa_metadata(ipa_path: str):
     try:
@@ -306,11 +363,25 @@ def get_sw():
 @app.get("/api/status")
 async def get_status(request: Request):
     global LAST_KNOWN_IP, CACHED_DEVICE_PROPS
-    client_ip = request.client.host if request.client else LAST_KNOWN_IP
-    if not client_ip.startswith("127.") and not client_ip.startswith("172.17."):
-        LAST_KNOWN_IP = client_ip
+    client_ip = request.client.host if request.client else None
+    query_ip = request.query_params.get("ip")
+    if query_ip and not is_local_or_docker(query_ip):
+        LAST_KNOWN_IP = query_ip.strip()
+        save_last_known_ip(LAST_KNOWN_IP)
+    elif client_ip and not is_local_or_docker(client_ip):
+        LAST_KNOWN_IP = client_ip.strip()
+        save_last_known_ip(LAST_KNOWN_IP)
 
     alive = is_device_alive(LAST_KNOWN_IP)
+    
+    conn_type = "Disconnected"
+    if alive:
+        if LAST_KNOWN_IP.startswith("192.168."):
+            conn_type = "Wi-Fi LAN"
+        elif LAST_KNOWN_IP.startswith("172.16.") or LAST_KNOWN_IP.startswith("10.") or LAST_KNOWN_IP.startswith("100."):
+            conn_type = "SSTP / VPN"
+        else:
+            conn_type = "Remote IP"
     
     device_info = {
         "device_name": CACHED_DEVICE_PROPS.get("DeviceName", os.getenv("DEVICE_NAME", "iPhone")),
@@ -319,7 +390,7 @@ async def get_status(request: Request):
         "device_udid": DEVICE_UDID,
         "ip": LAST_KNOWN_IP,
         "online": alive,
-        "connection_type": "Wi-Fi LAN" if alive else "Disconnected",
+        "connection_type": conn_type,
         "app_ids_used": len(CACHED_APPS_LIST) if CACHED_APPS_LIST else 0,
         "app_ids_max": 10
     }
@@ -445,13 +516,41 @@ async def get_apps(force: bool = False):
 def fallback_apps():
     return []
 
+@app.post("/api/set-ip")
+async def set_device_ip(request: Request):
+    global LAST_KNOWN_IP
+    ip = None
+    try:
+        data = await request.json()
+        ip = data.get("ip")
+    except Exception:
+        pass
+    if not ip:
+        ip = request.query_params.get("ip")
+    if not ip and request.client:
+        cand = request.client.host
+        if not is_local_or_docker(cand):
+            ip = cand
+    if ip and not is_local_or_docker(ip):
+        LAST_KNOWN_IP = ip.strip()
+        save_last_known_ip(LAST_KNOWN_IP)
+        register_device_to_netmuxd(LAST_KNOWN_IP)
+        alive = is_device_alive(LAST_KNOWN_IP)
+        return {"success": True, "ip": LAST_KNOWN_IP, "online": alive}
+    return JSONResponse(status_code=400, content={"success": False, "message": "Invalid IP address"})
+
 @app.api_route("/refresh", methods=["GET", "POST"])
 @app.api_route("/api/refresh", methods=["GET", "POST"])
 async def refresh_all(request: Request):
     global LAST_KNOWN_IP
-    client_ip = request.client.host if request.client else LAST_KNOWN_IP
-    if not client_ip.startswith("127.") and not client_ip.startswith("172.17."):
-        LAST_KNOWN_IP = client_ip
+    client_ip = request.client.host if request.client else None
+    query_ip = request.query_params.get("ip")
+    if query_ip and not is_local_or_docker(query_ip):
+        LAST_KNOWN_IP = query_ip.strip()
+        save_last_known_ip(LAST_KNOWN_IP)
+    elif client_ip and not is_local_or_docker(client_ip):
+        LAST_KNOWN_IP = client_ip.strip()
+        save_last_known_ip(LAST_KNOWN_IP)
 
     bundle_ids_to_refresh = set()
     if os.path.exists(PROFILES_DIR):
@@ -484,14 +583,25 @@ async def refresh_all(request: Request):
         gc.collect()
         return {"success": True, "message": f"Refreshed: {', '.join(sorted(set(refreshed)))}!"}
     else:
-        return JSONResponse(status_code=500, content={"success": False, "message": "Refresh failed. Please ensure iPhone is on Wi-Fi."})
+        return JSONResponse(
+            status_code=500, 
+            content={
+                "success": False, 
+                "message": "Refresh failed. Please ensure iPhone screen is awake and connected to home Wi-Fi or SSTP VPN."
+            }
+        )
 
 @app.post("/api/refresh-app")
 async def refresh_single_app(request: Request, bundle_id: str = Form(...)):
     global LAST_KNOWN_IP, CACHED_APPS_TIMESTAMP
-    client_ip = request.client.host if request.client else LAST_KNOWN_IP
-    if not client_ip.startswith("127.") and not client_ip.startswith("172.17."):
-        LAST_KNOWN_IP = client_ip
+    client_ip = request.client.host if request.client else None
+    query_ip = request.query_params.get("ip")
+    if query_ip and not is_local_or_docker(query_ip):
+        LAST_KNOWN_IP = query_ip.strip()
+        save_last_known_ip(LAST_KNOWN_IP)
+    elif client_ip and not is_local_or_docker(client_ip):
+        LAST_KNOWN_IP = client_ip.strip()
+        save_last_known_ip(LAST_KNOWN_IP)
 
     success, message = await push_certificate_profile_only(bundle_id)
     if success:
@@ -499,7 +609,13 @@ async def refresh_single_app(request: Request, bundle_id: str = Form(...)):
         gc.collect()
         return {"success": True, "message": f"Refreshed successfully (7 days renewed)!"}
     else:
-        return JSONResponse(status_code=500, content={"success": False, "message": message})
+        return JSONResponse(
+            status_code=500, 
+            content={
+                "success": False, 
+                "message": f"{message}. Ensure screen is awake on Wi-Fi or SSTP VPN."
+            }
+        )
 
 @app.get("/api/logs")
 def get_debug_logs():

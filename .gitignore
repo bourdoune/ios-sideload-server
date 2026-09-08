@@ -32,6 +32,7 @@ netmuxd
 
 # Runtime data & logs
 tg_config.json
+.device_ip
 *.log
 .DS_Store
 static/icons/
