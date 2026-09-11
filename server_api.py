@@ -262,13 +262,47 @@ def extract_ipa_metadata(ipa_path: str):
         print("Metadata extraction error:", e)
     return "com.sideload.app", "App", "1.0"
 
-def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = "App") -> Optional[str]:
+def extract_profile_expiration(prov_path: str) -> Optional[datetime]:
+    try:
+        if not os.path.exists(prov_path):
+            return None
+        with open(prov_path, "rb") as fp:
+            data = fp.read()
+        start = data.find(b"<?xml")
+        end = data.find(b"</plist>")
+        if start != -1 and end != -1:
+            p = plistlib.loads(data[start:end + 8])
+            exp = p.get("ExpirationDate")
+            if exp:
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                return exp
+    except Exception as e:
+        print(f"Error reading expiration date from {prov_path}: {e}")
+    return None
+
+def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = "App") -> tuple[Optional[str], bool, str]:
+    """
+    Downloads provisioning profile from Apple Developer portal.
+    Returns: (prov_path, is_extended, message)
+    - If Apple issued a new extended profile: returns (prov_path, True, "Renewed until <date>")
+    - If profile exists and is still active: returns (prov_path, False, "Profile is already active until <date>")
+    - If download failed: returns (None, False, "Error message")
+    """
     if not bundle_id.endswith(f".{TEAM_ID}"):
         registered_id = f"{bundle_id}.{TEAM_ID}"
     else:
         registered_id = bundle_id
 
     prov_path = os.path.join(PROFILES_DIR, f"{registered_id}.mobileprovision")
+    tmp_dl_path = os.path.join(PROFILES_DIR, f"{registered_id}.download.tmp")
+    if os.path.exists(tmp_dl_path):
+        try:
+            os.remove(tmp_dl_path)
+        except Exception:
+            pass
+
+    existing_exp = extract_profile_expiration(prov_path)
 
     env = os.environ.copy()
     env["HOME"] = os.path.expanduser("~")
@@ -276,47 +310,88 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
     env["APPLE_ID"] = APPLE_ID
     env["APPLE_PASSWORD"] = APPLE_PASS
 
-    cmd_dl = [SIDELOADER_BIN, "app-id", "download", "-i", "--team", TEAM_ID, "-o", prov_path, registered_id]
+    cmd_dl = [SIDELOADER_BIN, "app-id", "download", "-i", "--team", TEAM_ID, "-o", tmp_dl_path, registered_id]
     res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, capture_output=True, text=True)
-    if res_dl.returncode == 0 and os.path.exists(prov_path):
-        return prov_path
 
-    cmd_add = [SIDELOADER_BIN, "app-id", "add", "-i", "--team", TEAM_ID, app_name, registered_id]
-    subprocess.run(cmd_add, cwd=BASE_DIR, env=env, capture_output=True, text=True)
+    if res_dl.returncode != 0 or not os.path.exists(tmp_dl_path):
+        cmd_add = [SIDELOADER_BIN, "app-id", "add", "-i", "--team", TEAM_ID, app_name, registered_id]
+        subprocess.run(cmd_add, cwd=BASE_DIR, env=env, capture_output=True, text=True)
+        res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, capture_output=True, text=True)
 
-    res_dl2 = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, capture_output=True, text=True)
-    if res_dl2.returncode == 0 and os.path.exists(prov_path):
-        return prov_path
+    if res_dl.returncode == 0 and os.path.exists(tmp_dl_path) and os.path.getsize(tmp_dl_path) > 0:
+        new_exp = extract_profile_expiration(tmp_dl_path)
+        if new_exp:
+            if not existing_exp or new_exp > existing_exp:
+                shutil.move(tmp_dl_path, prov_path)
+                exp_str = new_exp.strftime("%b %d, %H:%M")
+                return prov_path, True, f"Renewed until {exp_str} UTC (7 days renewed)!"
+            else:
+                try:
+                    os.remove(tmp_dl_path)
+                except Exception:
+                    pass
+                now = datetime.now(timezone.utc)
+                delta = existing_exp - now
+                days = max(0, delta.days)
+                hours = max(0, delta.seconds // 3600)
+                exp_str = existing_exp.strftime("%b %d, %H:%M")
+                return prov_path, False, f"Profile is already active until {exp_str} UTC ({days}d {hours}h left). Apple renews closer to expiration."
 
-    return prov_path if os.path.exists(prov_path) else None
+    if os.path.exists(tmp_dl_path):
+        try:
+            os.remove(tmp_dl_path)
+        except Exception:
+            pass
 
-async def push_certificate_profile_only(bundle_id: str) -> tuple[bool, str]:
+    out_err = (res_dl.stdout or "") + (res_dl.stderr or "")
+    if "503" in out_err or res_dl.returncode == -11:
+        err_reason = "Apple Developer service temporarily busy (HTTP 503 / rate limit)."
+    else:
+        err_reason = "Could not download fresh profile from Apple."
+
+    if existing_exp and os.path.exists(prov_path):
+        now = datetime.now(timezone.utc)
+        delta = existing_exp - now
+        days = max(0, delta.days)
+        hours = max(0, delta.seconds // 3600)
+        exp_str = existing_exp.strftime("%b %d, %H:%M")
+        return prov_path, False, f"{err_reason} Existing profile is valid until {exp_str} UTC ({days}d {hours}h left)."
+
+    return None, False, f"Could not obtain profile for {registered_id}: {err_reason}"
+
+async def push_certificate_profile_only(bundle_id: str) -> tuple[bool, str, bool]:
     clean_name = bundle_id.split(".")[-2] if "." in bundle_id else "App"
-    prov_path = fetch_fresh_provisioning_profile_from_apple(bundle_id, clean_name)
+    prov_path, extended, message = fetch_fresh_provisioning_profile_from_apple(bundle_id, clean_name)
     if not prov_path or not os.path.exists(prov_path):
-        return False, f"Could not obtain profile for {bundle_id}"
+        return False, f"Could not obtain profile for {bundle_id}: {message}", False
+
+    if not extended:
+        ld = await get_lockdown_client()
+        if not ld:
+            return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
+        return True, message, False
 
     try:
         ld = await get_lockdown_client()
         if not ld:
-            return False, "Device unreachable over Wi-Fi"
+            return False, "Device unreachable over Wi-Fi / VPN", False
         async with MisagentService(ld) as mis:
             with open(prov_path, "rb") as f:
                 res = await mis.install(f)
                 if res.get("Status") == 0:
-                    return True, "Certificate refreshed successfully (7 days renewed)!"
+                    return True, message, True
                 else:
-                    return False, f"misagent error: {res}"
+                    return False, f"misagent error: {res}", False
     except Exception as e:
-        return False, str(e)
+        return False, str(e), False
 
 async def wireless_sign_and_install(ipa_path: str, custom_bundle_id: Optional[str] = None):
     orig_bundle_id, app_name, version = extract_ipa_metadata(ipa_path)
     target_bundle_id = custom_bundle_id or (f"{orig_bundle_id}.{TEAM_ID}" if not orig_bundle_id.endswith(f".{TEAM_ID}") else orig_bundle_id)
 
-    prov_path = fetch_fresh_provisioning_profile_from_apple(orig_bundle_id, app_name)
-    if not prov_path:
-        return False, f"Could not obtain Apple provisioning profile for {target_bundle_id}."
+    prov_path, extended, message = fetch_fresh_provisioning_profile_from_apple(orig_bundle_id, app_name)
+    if not prov_path or not os.path.exists(prov_path):
+        return False, f"Could not obtain Apple provisioning profile for {target_bundle_id}: {message}"
 
     with tempfile.NamedTemporaryFile(suffix=".ipa", delete=False) as tmp_signed:
         signed_ipa = tmp_signed.name
@@ -542,7 +617,7 @@ async def set_device_ip(request: Request):
 @app.api_route("/refresh", methods=["GET", "POST"])
 @app.api_route("/api/refresh", methods=["GET", "POST"])
 async def refresh_all(request: Request):
-    global LAST_KNOWN_IP
+    global LAST_KNOWN_IP, CACHED_APPS_TIMESTAMP
     client_ip = request.client.host if request.client else None
     query_ip = request.query_params.get("ip")
     if query_ip and not is_local_or_docker(query_ip):
@@ -570,24 +645,48 @@ async def refresh_all(request: Request):
     except Exception:
         pass
 
-    refreshed = []
+    renewed_apps = []
+    already_active_apps = []
+    failed_apps = []
+
     for bid in bundle_ids_to_refresh:
         parts = [p for p in bid.split(".") if p != TEAM_ID]
         clean_name = parts[-1].capitalize() if parts else "App"
-        s, m = await push_certificate_profile_only(bid)
-        if s:
-            refreshed.append(clean_name)
+        success, message, renewed = await push_certificate_profile_only(bid)
+        if success and renewed:
+            renewed_apps.append(clean_name)
+        elif success and not renewed:
+            already_active_apps.append(clean_name)
+        else:
+            failed_apps.append(f"{clean_name} ({message})")
 
-    if refreshed:
-        CACHED_APPS_TIMESTAMP = 0.0
-        gc.collect()
-        return {"success": True, "message": f"Refreshed: {', '.join(sorted(set(refreshed)))}!"}
+    CACHED_APPS_TIMESTAMP = 0.0
+    gc.collect()
+
+    if renewed_apps:
+        msg = f"Renewed (7 days): {', '.join(sorted(set(renewed_apps)))}!"
+        if already_active_apps:
+            msg += f" (Already valid: {', '.join(sorted(set(already_active_apps)))})"
+        return {"success": True, "message": msg}
+    elif already_active_apps:
+        min_days = 7
+        now = datetime.now(timezone.utc)
+        for fname in os.listdir(PROFILES_DIR):
+            if fname.endswith(".mobileprovision"):
+                exp = extract_profile_expiration(os.path.join(PROFILES_DIR, fname))
+                if exp:
+                    d = max(0, (exp - now).days)
+                    if d < min_days:
+                        min_days = d
+        msg = f"Apps are already up to date ({min_days}d left). Apple free accounts only renew certificates closer to expiration (<= 2 days)."
+        return {"success": True, "message": msg}
     else:
+        err_detail = "; ".join(failed_apps) if failed_apps else "Ensure iPhone screen is awake and connected to home Wi-Fi or SSTP VPN."
         return JSONResponse(
             status_code=500, 
             content={
                 "success": False, 
-                "message": "Refresh failed. Please ensure iPhone screen is awake and connected to home Wi-Fi or SSTP VPN."
+                "message": f"Refresh failed: {err_detail}"
             }
         )
 
@@ -603,11 +702,11 @@ async def refresh_single_app(request: Request, bundle_id: str = Form(...)):
         LAST_KNOWN_IP = client_ip.strip()
         save_last_known_ip(LAST_KNOWN_IP)
 
-    success, message = await push_certificate_profile_only(bundle_id)
+    success, message, renewed = await push_certificate_profile_only(bundle_id)
+    CACHED_APPS_TIMESTAMP = 0.0
+    gc.collect()
     if success:
-        CACHED_APPS_TIMESTAMP = 0.0
-        gc.collect()
-        return {"success": True, "message": f"Refreshed successfully (7 days renewed)!"}
+        return {"success": True, "message": message}
     else:
         return JSONResponse(
             status_code=500, 
