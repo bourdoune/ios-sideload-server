@@ -716,6 +716,56 @@ async def refresh_single_app(request: Request, bundle_id: str = Form(...)):
             }
         )
 
+LAST_AUTO_REFRESH_TIME = 0.0
+
+async def device_network_watcher_loop():
+    global LAST_AUTO_REFRESH_TIME
+    print("[Device Watcher] Background network watcher started.")
+    was_online = False
+    
+    while True:
+        try:
+            await asyncio.sleep(45)
+            if not LAST_KNOWN_IP:
+                continue
+                
+            is_online = is_device_alive(LAST_KNOWN_IP)
+            now_ts = time.time()
+            
+            # If device just came online, or hasn't had auto-refresh checked in 12 hours while online
+            just_connected = (not was_online and is_online)
+            routine_check_due = (is_online and (now_ts - LAST_AUTO_REFRESH_TIME > 12 * 3600))
+            
+            if just_connected or routine_check_due:
+                print(f"[Device Watcher] iPhone detected online at {LAST_KNOWN_IP} (just_connected={just_connected}, routine_check_due={routine_check_due}).")
+                register_device_to_netmuxd(LAST_KNOWN_IP)
+                await asyncio.sleep(5)  # Let connection stabilize
+                
+                ld = await get_lockdown_client()
+                if ld:
+                    print("[Device Watcher] Running automatic background refresh...")
+                    LAST_AUTO_REFRESH_TIME = now_ts
+                    bundle_ids = set()
+                    if os.path.exists(PROFILES_DIR):
+                        for fname in os.listdir(PROFILES_DIR):
+                            if fname.endswith(".mobileprovision"):
+                                bundle_ids.add(fname[:-len(".mobileprovision")])
+                    for bid in bundle_ids:
+                        try:
+                            s, m, renewed = await push_certificate_profile_only(bid)
+                            print(f"[Device Watcher] Auto-refresh {bid}: {m}")
+                        except Exception as ex:
+                            print(f"[Device Watcher] Auto-refresh {bid} error: {ex}")
+            
+            was_online = is_online
+        except Exception as e:
+            print("[Device Watcher] Error in watcher loop:", e)
+            await asyncio.sleep(60)
+
+@app.on_event("startup")
+async def on_startup():
+    asyncio.create_task(device_network_watcher_loop())
+
 @app.get("/api/logs")
 def get_debug_logs():
     try:
