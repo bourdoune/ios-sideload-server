@@ -300,7 +300,7 @@ def extract_profile_expiration(prov_path: str) -> Optional[datetime]:
         print(f"Error reading expiration date from {prov_path}: {e}")
     return None
 
-def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = "App") -> tuple[Optional[str], bool, str]:
+def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = "App", force: bool = True) -> tuple[Optional[str], bool, str]:
     """
     Downloads provisioning profile from Apple Developer portal.
     Returns: (prov_path, is_extended, message)
@@ -322,6 +322,17 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
             pass
 
     existing_exp = extract_profile_expiration(prov_path)
+
+    # When not forcing renewal, preserve existing profile if it has plenty of validity (> 60h / 2.5d)
+    if not force and existing_exp:
+        now = datetime.now(timezone.utc)
+        delta = existing_exp - now
+        hours_left = delta.total_seconds() / 3600.0
+        if hours_left > 60.0:
+            days = max(0, delta.days)
+            hours = max(0, delta.seconds // 3600)
+            exp_str = existing_exp.strftime("%b %d, %H:%M")
+            return prov_path, False, f"Profile is already active until {exp_str} UTC ({days}d {hours}h left)."
 
     ensure_sideloader_device_config()
 
@@ -391,11 +402,15 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
 
     return None, False, f"Could not obtain profile for {registered_id}: {err_reason}"
 
-async def push_certificate_profile_only(bundle_id: str) -> tuple[bool, str, bool]:
+async def push_certificate_profile_only(bundle_id: str, force: bool = True) -> tuple[bool, str, bool]:
     clean_name = bundle_id.split(".")[-2] if "." in bundle_id else "App"
-    prov_path, extended, message = fetch_fresh_provisioning_profile_from_apple(bundle_id, clean_name)
+    prov_path, extended, message = fetch_fresh_provisioning_profile_from_apple(bundle_id, clean_name, force=force)
     if not prov_path or not os.path.exists(prov_path):
         return False, f"Could not obtain profile for {bundle_id}: {message}", False
+
+    # If profile was not extended and renewal was not forced, it is already active and valid on device
+    if not extended and not force:
+        return True, message, False
 
     try:
         ld = await get_lockdown_client()
@@ -743,11 +758,32 @@ async def refresh_single_app(request: Request, bundle_id: str = Form(...)):
         )
 
 LAST_AUTO_REFRESH_TIME = 0.0
+AUTO_REFRESH_THRESHOLD_HOURS = 60.0  # Only auto-refresh if <= 2.5 days left
+AUTO_REFRESH_ROUTINE_INTERVAL = 12 * 3600  # Routine check interval (12 hours)
+AUTO_REFRESH_MIN_COOLDOWN = 3600  # Minimum 1 hour between any auto-refresh attempts
+
+def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOURS) -> list[str]:
+    """Check profiles directory and return bundle IDs that have <= threshold_hours remaining or are missing/invalid."""
+    needing = []
+    now = datetime.now(timezone.utc)
+    if os.path.exists(PROFILES_DIR):
+        for fname in os.listdir(PROFILES_DIR):
+            if fname.endswith(".mobileprovision"):
+                bid = fname[:-len(".mobileprovision")]
+                exp = extract_profile_expiration(os.path.join(PROFILES_DIR, fname))
+                if not exp:
+                    needing.append(bid)
+                else:
+                    hours_left = (exp - now).total_seconds() / 3600.0
+                    if hours_left <= threshold_hours:
+                        needing.append(bid)
+    return needing
 
 async def device_network_watcher_loop():
     global LAST_AUTO_REFRESH_TIME
-    print("[Device Watcher] Background network watcher started.")
+    print("[Device Watcher] Background network watcher started.", flush=True)
     was_online = False
+    consecutive_offline = 0
     
     while True:
         try:
@@ -755,37 +791,52 @@ async def device_network_watcher_loop():
             if not LAST_KNOWN_IP:
                 continue
                 
-            is_online = is_device_alive(LAST_KNOWN_IP)
+            alive = is_device_alive(LAST_KNOWN_IP)
             now_ts = time.time()
             
-            # If device just came online, or hasn't had auto-refresh checked in 12 hours while online
-            just_connected = (not was_online and is_online)
-            routine_check_due = (is_online and (now_ts - LAST_AUTO_REFRESH_TIME > 12 * 3600))
-            
-            if just_connected or routine_check_due:
-                print(f"[Device Watcher] iPhone detected online at {LAST_KNOWN_IP} (just_connected={just_connected}, routine_check_due={routine_check_due}).")
-                register_device_to_netmuxd(LAST_KNOWN_IP)
-                await asyncio.sleep(5)  # Let connection stabilize
+            if alive:
+                # Require at least 3 consecutive offline checks (~2.25 min) to be considered 'just reconnected'
+                # This prevents iOS screen sleep / Wi-Fi power-save momentary drops from toggling state
+                just_connected = (not was_online and consecutive_offline >= 3)
+                consecutive_offline = 0
+                was_online = True
                 
-                ld = await get_lockdown_client()
-                if ld:
-                    print("[Device Watcher] Running automatic background refresh...")
-                    LAST_AUTO_REFRESH_TIME = now_ts
-                    bundle_ids = set()
-                    if os.path.exists(PROFILES_DIR):
-                        for fname in os.listdir(PROFILES_DIR):
-                            if fname.endswith(".mobileprovision"):
-                                bundle_ids.add(fname[:-len(".mobileprovision")])
-                    for bid in bundle_ids:
-                        try:
-                            s, m, renewed = await push_certificate_profile_only(bid)
-                            print(f"[Device Watcher] Auto-refresh {bid}: {m}")
-                        except Exception as ex:
-                            print(f"[Device Watcher] Auto-refresh {bid} error: {ex}")
-            
-            was_online = is_online
+                # Keep netmuxd registered if device dropped out of usbmux
+                if not is_device_in_netmuxd():
+                    register_device_to_netmuxd(LAST_KNOWN_IP)
+                
+                # Check if routine 12-hour check is due or device just reconnected after being away
+                routine_check_due = (now_ts - LAST_AUTO_REFRESH_TIME >= AUTO_REFRESH_ROUTINE_INTERVAL)
+                cooldown_passed = (now_ts - LAST_AUTO_REFRESH_TIME >= AUTO_REFRESH_MIN_COOLDOWN)
+                
+                if (just_connected or routine_check_due) and cooldown_passed:
+                    needing_apps = get_apps_needing_refresh(threshold_hours=AUTO_REFRESH_THRESHOLD_HOURS)
+                    
+                    if not needing_apps:
+                        print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP}. All profiles have >{AUTO_REFRESH_THRESHOLD_HOURS/24:.1f}d remaining. Skipping auto-refresh.", flush=True)
+                        LAST_AUTO_REFRESH_TIME = now_ts
+                    else:
+                        print(f"[Device Watcher] iPhone detected online at {LAST_KNOWN_IP}. Apps needing renewal: {needing_apps}", flush=True)
+                        await asyncio.sleep(5)  # Let connection stabilize
+                        
+                        ld = await get_lockdown_client()
+                        if ld:
+                            print(f"[Device Watcher] Running automatic background refresh for {len(needing_apps)} app(s)...", flush=True)
+                            LAST_AUTO_REFRESH_TIME = now_ts
+                            for bid in needing_apps:
+                                try:
+                                    s, m, renewed = await push_certificate_profile_only(bid, force=False)
+                                    print(f"[Device Watcher] Auto-refresh {bid}: {m}", flush=True)
+                                except Exception as ex:
+                                    print(f"[Device Watcher] Auto-refresh {bid} error: {ex}", flush=True)
+            else:
+                consecutive_offline += 1
+                # Only mark offline after 3 consecutive failed probes (~2.25 minutes)
+                if consecutive_offline >= 3:
+                    was_online = False
+                    
         except Exception as e:
-            print("[Device Watcher] Error in watcher loop:", e)
+            print("[Device Watcher] Error in watcher loop:", e, flush=True)
             await asyncio.sleep(60)
 
 @app.on_event("startup")
