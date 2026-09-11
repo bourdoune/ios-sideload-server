@@ -29,6 +29,7 @@ AltServer
 sideloader
 zsign
 netmuxd
+*.so
 
 # Runtime data & logs
 tg_config.json

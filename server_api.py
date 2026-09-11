@@ -33,10 +33,29 @@ TEAM_ID = os.getenv("TEAM_ID", "")
 STATIC_DIR = os.path.join(BASE_DIR, "static")
 PROFILES_DIR = os.path.join(BASE_DIR, "profiles")
 SIDELOADER_BIN = os.path.join(BASE_DIR, "sideloader")
+SIDELOADER_SHIM_SO = os.path.join(BASE_DIR, "sideloader_shim.so")
 ZSIGN_BIN = os.path.join(BASE_DIR, "zsign")
 KEY_PEM = os.getenv("KEY_PEM", os.path.expanduser("~/.config/Sideloader/keys/key.pem"))
 CERT_PEM = os.path.join(BASE_DIR, "cert.pem")
 DEFAULT_APP_IPA = os.path.join(BASE_DIR, "app.ipa")
+
+def ensure_sideloader_device_config():
+    """Ensure ~/.config/Sideloader/device.json uses clean clientInfo without Xcode suffix to prevent HTTP 503 from Apple."""
+    conf_dir = os.path.expanduser("~/.config/Sideloader")
+    dev_path = os.path.join(conf_dir, "device.json")
+    if os.path.exists(dev_path):
+        try:
+            import json as _json
+            with open(dev_path, "r") as f:
+                d = _json.load(f)
+            ci = d.get("clientInfo", "")
+            if "com.apple.dt.Xcode" in ci or not ci:
+                d["clientInfo"] = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1>"
+                with open(dev_path, "w") as f:
+                    _json.dump(d, f)
+        except Exception as e:
+            print(f"Error sanitizing device.json: {e}")
+ensure_sideloader_device_config()
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -304,19 +323,32 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
 
     existing_exp = extract_profile_expiration(prov_path)
 
+    ensure_sideloader_device_config()
+
     env = os.environ.copy()
     env["HOME"] = os.path.expanduser("~")
     env["ALTSERVER_ANISETTE_SERVER"] = os.getenv("ALTSERVER_ANISETTE_SERVER", "http://127.0.0.1:6970")
     env["APPLE_ID"] = APPLE_ID
+    env["APPLE_PASS"] = APPLE_PASS
     env["APPLE_PASSWORD"] = APPLE_PASS
+    if os.path.exists(SIDELOADER_SHIM_SO):
+        env["LD_PRELOAD"] = SIDELOADER_SHIM_SO
+
+    auth_input = f"{APPLE_ID}\n"
 
     cmd_dl = [SIDELOADER_BIN, "app-id", "download", "-i", "--team", TEAM_ID, "-o", tmp_dl_path, registered_id]
-    res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, capture_output=True, text=True)
+    try:
+        res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=40)
+    except subprocess.TimeoutExpired:
+        res_dl = subprocess.CompletedProcess(cmd_dl, -1, stdout="", stderr="Timeout downloading profile")
 
     if res_dl.returncode != 0 or not os.path.exists(tmp_dl_path):
         cmd_add = [SIDELOADER_BIN, "app-id", "add", "-i", "--team", TEAM_ID, app_name, registered_id]
-        subprocess.run(cmd_add, cwd=BASE_DIR, env=env, capture_output=True, text=True)
-        res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, capture_output=True, text=True)
+        try:
+            subprocess.run(cmd_add, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=40)
+            res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=40)
+        except subprocess.TimeoutExpired:
+            pass
 
     if res_dl.returncode == 0 and os.path.exists(tmp_dl_path) and os.path.getsize(tmp_dl_path) > 0:
         new_exp = extract_profile_expiration(tmp_dl_path)
@@ -335,7 +367,7 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
                 days = max(0, delta.days)
                 hours = max(0, delta.seconds // 3600)
                 exp_str = existing_exp.strftime("%b %d, %H:%M")
-                return prov_path, False, f"Profile is already active until {exp_str} UTC ({days}d {hours}h left). Apple renews closer to expiration."
+                return prov_path, False, f"Profile is already active until {exp_str} UTC ({days}d {hours}h left)."
 
     if os.path.exists(tmp_dl_path):
         try:
@@ -365,21 +397,15 @@ async def push_certificate_profile_only(bundle_id: str) -> tuple[bool, str, bool
     if not prov_path or not os.path.exists(prov_path):
         return False, f"Could not obtain profile for {bundle_id}: {message}", False
 
-    if not extended:
-        ld = await get_lockdown_client()
-        if not ld:
-            return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
-        return True, message, False
-
     try:
         ld = await get_lockdown_client()
         if not ld:
-            return False, "Device unreachable over Wi-Fi / VPN", False
+            return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
         async with MisagentService(ld) as mis:
             with open(prov_path, "rb") as f:
                 res = await mis.install(f)
                 if res.get("Status") == 0:
-                    return True, message, True
+                    return True, message, extended
                 else:
                     return False, f"misagent error: {res}", False
     except Exception as e:
@@ -678,7 +704,7 @@ async def refresh_all(request: Request):
                     d = max(0, (exp - now).days)
                     if d < min_days:
                         min_days = d
-        msg = f"Apps are already up to date ({min_days}d left). Apple free accounts only renew certificates closer to expiration (<= 2 days)."
+        msg = f"All apps are active and up to date ({min_days}d left)."
         return {"success": True, "message": msg}
     else:
         err_detail = "; ".join(failed_apps) if failed_apps else "Ensure iPhone screen is awake and connected to home Wi-Fi or SSTP VPN."
