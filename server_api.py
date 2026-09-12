@@ -403,7 +403,8 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
     return None, False, f"Could not obtain profile for {registered_id}: {err_reason}"
 
 async def push_certificate_profile_only(bundle_id: str, force: bool = True) -> tuple[bool, str, bool]:
-    clean_name = bundle_id.split(".")[-2] if "." in bundle_id else "App"
+    parts = [p for p in bundle_id.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
+    clean_name = parts[-1].capitalize() if parts else "App"
     prov_path, extended, message = fetch_fresh_provisioning_profile_from_apple(bundle_id, clean_name, force=force)
     if not prov_path or not os.path.exists(prov_path):
         return False, f"Could not obtain profile for {bundle_id}: {message}", False
@@ -412,19 +413,70 @@ async def push_certificate_profile_only(bundle_id: str, force: bool = True) -> t
     if not extended and not force:
         return True, message, False
 
-    try:
-        ld = await get_lockdown_client()
-        if not ld:
-            return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
-        async with MisagentService(ld) as mis:
-            with open(prov_path, "rb") as f:
-                res = await mis.install(f)
-                if res.get("Status") == 0:
-                    return True, message, extended
-                else:
-                    return False, f"misagent error: {res}", False
-    except Exception as e:
-        return False, str(e), False
+    # Look for cached base IPA in installed_apps
+    base_ipa = os.path.join(BASE_DIR, "installed_apps", f"{bundle_id}.ipa")
+    if not os.path.exists(base_ipa):
+        # Also check fallback locations (e.g. LiveContainer.ipa)
+        if "livecontainer" in bundle_id.lower():
+            cand = os.path.join(BASE_DIR, "LiveContainer.ipa")
+            if os.path.exists(cand):
+                base_ipa = cand
+
+    if os.path.exists(base_ipa):
+        # Full app refresh: re-sign IPA with fresh profile and install via InstallationProxyService
+        with tempfile.NamedTemporaryFile(suffix=".ipa", delete=False) as tmp_signed:
+            signed_ipa = tmp_signed.name
+
+        try:
+            cmd = [
+                ZSIGN_BIN,
+                "-k", KEY_PEM,
+                "-c", CERT_PEM,
+                "-m", prov_path,
+                "-b", bundle_id,
+                "-o", signed_ipa,
+                base_ipa
+            ]
+            res = subprocess.run(cmd, cwd=BASE_DIR, capture_output=True, text=True)
+            if res.returncode != 0:
+                return False, f"Signing error during refresh:\n{res.stdout}\n{res.stderr}", False
+
+            ld = await get_lockdown_client()
+            if not ld:
+                return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
+
+            async with InstallationProxyService(ld) as ips:
+                await ips.install_from_local(signed_ipa)
+
+            # Also install profile via misagent to keep system cache in sync
+            try:
+                async with MisagentService(ld) as mis:
+                    with open(prov_path, "rb") as f:
+                        await mis.install(f)
+            except Exception:
+                pass
+
+            return True, f"{clean_name} renewed and re-installed (7 days renewed)!", True
+        except Exception as e:
+            return False, f"Error updating {clean_name}: {e}", False
+        finally:
+            if os.path.exists(signed_ipa):
+                os.remove(signed_ipa)
+    else:
+        # Fallback if base IPA is missing: push profile via misagent and prompt user
+        try:
+            ld = await get_lockdown_client()
+            if not ld:
+                return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
+            async with MisagentService(ld) as mis:
+                with open(prov_path, "rb") as f:
+                    res = await mis.install(f)
+                    if res.get("Status") == 0:
+                        return True, f"{message} (Base IPA not found on server; re-upload {clean_name} once to enable automatic app re-installation)", extended
+                    else:
+                        return False, f"misagent error: {res}", False
+        except Exception as e:
+            return False, str(e), False
 
 async def wireless_sign_and_install(ipa_path: str, custom_bundle_id: Optional[str] = None):
     orig_bundle_id, app_name, version = extract_ipa_metadata(ipa_path)
@@ -460,6 +512,14 @@ async def wireless_sign_and_install(ipa_path: str, custom_bundle_id: Optional[st
 
         # Extract app icon to static/icons
         extract_and_save_app_icon(ipa_path, target_bundle_id)
+
+        # Cache original base IPA for seamless future wireless auto-refreshes
+        os.makedirs(os.path.join(BASE_DIR, "installed_apps"), exist_ok=True)
+        cached_ipa = os.path.join(BASE_DIR, "installed_apps", f"{target_bundle_id}.ipa")
+        try:
+            shutil.copy2(ipa_path, cached_ipa)
+        except Exception as e:
+            print(f"Warning: could not cache IPA to {cached_ipa}: {e}")
 
         return True, f"{app_name} installed successfully!"
     except Exception as e:
