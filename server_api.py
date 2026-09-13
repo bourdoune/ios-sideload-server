@@ -701,11 +701,11 @@ async def get_apps(force: bool = False):
                         pct = max(0, min(100, int((delta.total_seconds() / (7 * 86400)) * 100)))
                         exp_str = exp_date.strftime("%b %d, %H:%M")
                     else:
-                        days = 7
-                        total_hours = 168
-                        time_left_str = "7 days left"
-                        pct = 100
-                        exp_str = "Valid (7 Days)"
+                        days = 0
+                        total_hours = 0
+                        time_left_str = "Needs Refresh"
+                        pct = 0
+                        exp_str = "No Profile"
 
                     icon_url = None
                     icon_file = os.path.join(ICONS_DIR, f"{bid}.png")
