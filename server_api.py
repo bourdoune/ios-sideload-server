@@ -1615,7 +1615,7 @@ def pwa_index(request: Request):
                     btn.innerHTML = '<span class="spinner-icon"></span> Refreshing...';
                     btn.disabled = true;
                 }
-                showToast('Refreshing certificate from Apple...', true);
+                showToast('Syncing app certificate...', true);
                 const form = new FormData();
                 form.append('bundle_id', bundleId);
                 try {
