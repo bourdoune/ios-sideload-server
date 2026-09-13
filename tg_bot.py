@@ -91,18 +91,20 @@ async def set_device_ip(session: aiohttp.ClientSession, ip: str):
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-async def trigger_refresh_all(session: aiohttp.ClientSession):
+async def trigger_refresh_all(session: aiohttp.ClientSession, force: bool = False):
     try:
-        async with session.post(f"{LOCAL_API_BASE}/api/refresh", timeout=40) as resp:
+        url = f"{LOCAL_API_BASE}/api/refresh{'?force=true' if force else ''}"
+        async with session.post(url, timeout=50) as resp:
             return await resp.json()
     except Exception as e:
         return {"success": False, "message": str(e)}
 
-async def trigger_refresh_app(session: aiohttp.ClientSession, bundle_id: str):
+async def trigger_refresh_app(session: aiohttp.ClientSession, bundle_id: str, force: bool = False):
     try:
+        url = f"{LOCAL_API_BASE}/api/refresh-app{'?force=true' if force else ''}"
         data = aiohttp.FormData()
         data.add_field("bundle_id", bundle_id)
-        async with session.post(f"{LOCAL_API_BASE}/api/refresh-app", data=data, timeout=35) as resp:
+        async with session.post(url, data=data, timeout=40) as resp:
             return await resp.json()
     except Exception as e:
         return {"success": False, "message": str(e)}
@@ -143,15 +145,18 @@ def format_status_message(status, apps):
 def get_main_keyboard(apps):
     inline_keyboard = [
         [
-            {"text": "🔄 Refresh All Apps", "callback_data": "refresh_all"},
+            {"text": "⚡ Force Renew All (Apple)", "callback_data": "refresh_force"},
             {"text": "📊 Check Status", "callback_data": "status"}
+        ],
+        [
+            {"text": "🔄 Quick Sync (Wi-Fi)", "callback_data": "refresh_quick"}
         ]
     ]
     app_buttons = []
     for app in apps:
         clean_name = app.get("name", "App")
         bid = app.get("bundle_id")
-        app_buttons.append({"text": f"↻ {clean_name}", "callback_data": f"ref:{bid}"})
+        app_buttons.append({"text": f"⚡ Renew {clean_name}", "callback_data": f"ref_force:{bid}"})
     if app_buttons:
         # Group in pairs
         grouped = [app_buttons[i:i+2] for i in range(0, len(app_buttons), 2)]
@@ -178,10 +183,13 @@ async def handle_update(session: aiohttp.ClientSession, update: dict, config: di
             reply_text = format_status_message(status, apps)
             kb = get_main_keyboard(apps)
             await send_tg_message(session, chat_id, reply_text, reply_markup=kb)
-            
-        elif text in ["/refresh", "refresh"]:
-            await send_tg_message(session, chat_id, "⏳ <i>Refreshing all apps over Wi-Fi / VPN...</i>")
-            res = await trigger_refresh_all(session)
+
+        elif text in ["/renew", "/force", "force", "renew", "/refresh", "refresh"]:
+            is_quick = (text == "/sync")
+            force = not is_quick
+            action_desc = "Contacting Apple & force-renewing certificates..." if force else "Syncing profiles over Wi-Fi / VPN..."
+            await send_tg_message(session, chat_id, f"⏳ <i>{action_desc}</i>")
+            res = await trigger_refresh_all(session, force=force)
             if res.get("success"):
                 await send_tg_message(session, chat_id, f"✅ {res.get('message', 'All apps refreshed!')}")
             else:
@@ -219,10 +227,10 @@ async def handle_update(session: aiohttp.ClientSession, update: dict, config: di
             apps = await get_apps_list(session)
             await send_tg_message(session, chat_id, format_status_message(status, apps), reply_markup=get_main_keyboard(apps))
 
-        elif data == "refresh_all":
-            await answer_callback_query(session, cb_id, "Refreshing apps...")
-            await send_tg_message(session, chat_id, "⏳ <i>Refreshing all apps over Wi-Fi / VPN...</i>")
-            res = await trigger_refresh_all(session)
+        elif data in ["refresh_force", "refresh_all"]:
+            await answer_callback_query(session, cb_id, "Force renewing from Apple...")
+            await send_tg_message(session, chat_id, "⏳ <i>Contacting Apple & force-renewing certificates...</i>")
+            res = await trigger_refresh_all(session, force=True)
             if res.get("success"):
                 await send_tg_message(session, chat_id, f"✅ {res.get('message')}")
             else:
@@ -232,11 +240,24 @@ async def handle_update(session: aiohttp.ClientSession, update: dict, config: di
             apps = await get_apps_list(session)
             await send_tg_message(session, chat_id, format_status_message(status, apps), reply_markup=get_main_keyboard(apps))
 
-        elif data.startswith("ref:"):
-            bundle_id = data[4:]
-            await answer_callback_query(session, cb_id, "Refreshing app...")
-            await send_tg_message(session, chat_id, f"⏳ <i>Refreshing app ({bundle_id})...</i>")
-            res = await trigger_refresh_app(session, bundle_id)
+        elif data == "refresh_quick":
+            await answer_callback_query(session, cb_id, "Syncing profiles...")
+            await send_tg_message(session, chat_id, "⏳ <i>Syncing profiles over Wi-Fi / VPN...</i>")
+            res = await trigger_refresh_all(session, force=False)
+            if res.get("success"):
+                await send_tg_message(session, chat_id, f"✅ {res.get('message')}")
+            else:
+                msg = res.get('message', 'Sync failed')
+                await send_tg_message(session, chat_id, f"❌ {msg}\n\n💡 <i>Ensure iPhone screen is unlocked so iOS wakes the VPN interface.</i>")
+            status = await get_device_status(session)
+            apps = await get_apps_list(session)
+            await send_tg_message(session, chat_id, format_status_message(status, apps), reply_markup=get_main_keyboard(apps))
+
+        elif data.startswith("ref_force:") or data.startswith("ref:"):
+            bundle_id = data.split(":", 1)[1]
+            await answer_callback_query(session, cb_id, "Force renewing app from Apple...")
+            await send_tg_message(session, chat_id, f"⏳ <i>Contacting Apple & renewing app ({bundle_id})...</i>")
+            res = await trigger_refresh_app(session, bundle_id, force=True)
             if res.get("success"):
                 await send_tg_message(session, chat_id, f"✅ {res.get('message')}")
             else:

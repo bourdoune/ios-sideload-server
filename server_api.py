@@ -371,7 +371,7 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
     if res_dl.returncode == 0 and os.path.exists(tmp_dl_path) and os.path.getsize(tmp_dl_path) > 0:
         new_exp = extract_profile_expiration(tmp_dl_path)
         if new_exp:
-            if not existing_exp or new_exp > existing_exp:
+            if not existing_exp or new_exp >= existing_exp or force:
                 shutil.move(tmp_dl_path, prov_path)
                 exp_str = new_exp.strftime("%b %d, %H:%M")
                 return prov_path, True, f"Renewed until {exp_str} UTC (7 days renewed)!"
@@ -482,7 +482,7 @@ async def batch_push_certificate_profiles(
             for bid, prov_path, message, extended in profiles_to_install:
                 new_uuid, _ = extract_profile_info(prov_path)
 
-                if new_uuid and new_uuid in existing_by_uuid:
+                if not force and new_uuid and new_uuid in existing_by_uuid:
                     # Already present and active on device!
                     results[bid] = (True, message, extended)
                 else:
