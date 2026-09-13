@@ -870,10 +870,16 @@ async def device_network_watcher_loop():
                 cooldown_passed = (now_ts - LAST_AUTO_REFRESH_TIME >= AUTO_REFRESH_MIN_COOLDOWN)
                 
                 if (just_connected or routine_check_due) and cooldown_passed:
-                    needing_apps = get_apps_needing_refresh(threshold_hours=AUTO_REFRESH_THRESHOLD_HOURS)
+                    is_wifi_lan = LAST_KNOWN_IP.startswith("192.168.")
+                    # On VPN/cellular, defer heavy background re-installs unless urgently expiring (<= 12h left) to conserve mobile data
+                    effective_threshold = AUTO_REFRESH_THRESHOLD_HOURS if is_wifi_lan else 12.0
+                    needing_apps = get_apps_needing_refresh(threshold_hours=effective_threshold)
                     
                     if not needing_apps:
-                        print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP}. All profiles have >{AUTO_REFRESH_THRESHOLD_HOURS/24:.1f}d remaining. Skipping auto-refresh.", flush=True)
+                        if not is_wifi_lan:
+                            print(f"[Device Watcher] iPhone connected via VPN ({LAST_KNOWN_IP}). Deferring heavy background auto-refresh until connected to Home Wi-Fi.", flush=True)
+                        else:
+                            print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP}. All profiles have >{AUTO_REFRESH_THRESHOLD_HOURS/24:.1f}d remaining. Skipping auto-refresh.", flush=True)
                         LAST_AUTO_REFRESH_TIME = now_ts
                     else:
                         print(f"[Device Watcher] iPhone detected online at {LAST_KNOWN_IP}. Apps needing renewal: {needing_apps}", flush=True)
