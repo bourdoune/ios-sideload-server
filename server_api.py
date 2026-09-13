@@ -894,16 +894,18 @@ AUTO_REFRESH_THRESHOLD_HOURS = 60.0  # Only auto-refresh if <= 2.5 days left
 AUTO_REFRESH_ROUTINE_INTERVAL = 12 * 3600  # Routine check interval (12 hours)
 AUTO_REFRESH_MIN_COOLDOWN = 3600  # Minimum 1 hour between any auto-refresh attempts
 LAST_PREFETCH_TIME = 0.0
-PREFETCH_INTERVAL = 6 * 3600  # Check Apple developer portal every 6 hours
+PREFETCH_INTERVAL = 12 * 3600  # Check and pre-fetch from Apple developer portal every 12 hours
 
 def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOURS) -> list[str]:
     """Check profiles directory and return bundle IDs that have <= threshold_hours remaining or are missing/invalid."""
     needing = []
+    known_bids = set()
     now = datetime.now(timezone.utc)
     if os.path.exists(PROFILES_DIR):
         for fname in os.listdir(PROFILES_DIR):
             if fname.endswith(".mobileprovision"):
                 bid = fname[:-len(".mobileprovision")]
+                known_bids.add(bid)
                 exp = extract_profile_expiration(os.path.join(PROFILES_DIR, fname))
                 if not exp:
                     needing.append(bid)
@@ -911,7 +913,12 @@ def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOU
                     hours_left = (exp - now).total_seconds() / 3600.0
                     if hours_left <= threshold_hours:
                         needing.append(bid)
-    return needing
+    if CACHED_APPS_LIST:
+        for app in CACHED_APPS_LIST:
+            bid = app.get("bundle_id")
+            if bid and bid not in known_bids:
+                needing.append(bid)
+    return list(dict.fromkeys(needing))
 
 async def prefetch_expiring_profiles_if_needed():
     """Pre-downloads expiring profiles from Apple Developer portal in the background so on-Wi-Fi push is instant (<2s)."""
