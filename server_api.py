@@ -281,24 +281,28 @@ def extract_ipa_metadata(ipa_path: str):
         print("Metadata extraction error:", e)
     return "com.sideload.app", "App", "1.0"
 
-def extract_profile_expiration(prov_path: str) -> Optional[datetime]:
+def extract_profile_info(prov_path: str) -> tuple[Optional[str], Optional[datetime]]:
     try:
         if not os.path.exists(prov_path):
-            return None
+            return None, None
         with open(prov_path, "rb") as fp:
             data = fp.read()
         start = data.find(b"<?xml")
         end = data.find(b"</plist>")
         if start != -1 and end != -1:
             p = plistlib.loads(data[start:end + 8])
+            uuid = p.get("UUID")
             exp = p.get("ExpirationDate")
-            if exp:
-                if exp.tzinfo is None:
-                    exp = exp.replace(tzinfo=timezone.utc)
-                return exp
+            if exp and exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            return uuid, exp
     except Exception as e:
-        print(f"Error reading expiration date from {prov_path}: {e}")
-    return None
+        print(f"Error reading profile info from {prov_path}: {e}")
+    return None, None
+
+def extract_profile_expiration(prov_path: str) -> Optional[datetime]:
+    _, exp = extract_profile_info(prov_path)
+    return exp
 
 def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = "App", force: bool = True) -> tuple[Optional[str], bool, str]:
     """
@@ -353,11 +357,14 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
     except subprocess.TimeoutExpired:
         res_dl = subprocess.CompletedProcess(cmd_dl, -1, stdout="", stderr="Timeout downloading profile")
 
-    if res_dl.returncode != 0 or not os.path.exists(tmp_dl_path):
+    out_dl = (res_dl.stdout or "") + (res_dl.stderr or "")
+    # Only try 'app-id add' if the app ID was not found / unregistered, NOT on 503, rate-limits, or timeouts
+    is_transient_error = "503" in out_dl or "rate limit" in out_dl.lower() or res_dl.returncode == -11
+    if (res_dl.returncode != 0 or not os.path.exists(tmp_dl_path)) and not is_transient_error and not os.path.exists(prov_path):
         cmd_add = [SIDELOADER_BIN, "app-id", "add", "-i", "--team", TEAM_ID, app_name, registered_id]
         try:
-            subprocess.run(cmd_add, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=40)
-            res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=40)
+            subprocess.run(cmd_add, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=20)
+            res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=20)
         except subprocess.TimeoutExpired:
             pass
 
@@ -402,47 +409,119 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
 
     return None, False, f"Could not obtain profile for {registered_id}: {err_reason}"
 
-async def push_certificate_profile_only(bundle_id: str, force: bool = True) -> tuple[bool, str, bool]:
-    parts = [p for p in bundle_id.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
-    clean_name = parts[-1].capitalize() if parts else "App"
-    prov_path, extended, message = fetch_fresh_provisioning_profile_from_apple(bundle_id, clean_name, force=force)
-    if not prov_path or not os.path.exists(prov_path):
-        return False, f"Could not obtain profile for {bundle_id}: {message}", False
+async def batch_push_certificate_profiles(
+    bundle_ids: list[str],
+    force: bool = True,
+    pre_connected_ld: Optional[Any] = None
+) -> dict[str, tuple[bool, str, bool]]:
+    """
+    Refreshes provisioning profiles for multiple apps in parallel with pipelined device operations.
+    1. Downloads all required profiles from Apple Developer portal concurrently using worker threads.
+    2. Concurrently connects / verifies the Lockdown connection to the iPhone.
+    3. Performs batch Misagent operations over a single session (single copy_all, purges old UUIDs, installs fresh profiles).
+    Returns: {bundle_id: (success, message, is_extended)}
+    """
+    if not bundle_ids:
+        return {}
 
-    # If profile was not extended and renewal was not forced, it is already active and valid on device
-    if not extended and not force:
-        return True, message, False
+    unique_bids = list(dict.fromkeys(bundle_ids))
+    results: dict[str, tuple[bool, str, bool]] = {}
+
+    def _fetch_app(bid: str):
+        parts = [p for p in bid.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
+        clean_name = parts[-1].capitalize() if parts else "App"
+        return bid, fetch_fresh_provisioning_profile_from_apple(bid, clean_name, force=force)
+
+    # Launch parallel downloads in thread pool
+    fetch_tasks = [asyncio.to_thread(_fetch_app, bid) for bid in unique_bids]
+
+    async def _get_ld():
+        if pre_connected_ld is not None:
+            return pre_connected_ld
+        return await get_lockdown_client()
+
+    # Pipeline Apple downloads and device connection concurrently
+    download_future = asyncio.gather(*fetch_tasks, return_exceptions=True)
+    ld_future = _get_ld()
+
+    fetched_items, ld = await asyncio.gather(download_future, ld_future)
+
+    profiles_to_install: list[tuple[str, str, str, bool]] = []
+
+    for item in fetched_items:
+        if isinstance(item, Exception):
+            continue
+        bid, (prov_path, extended, message) = item
+        if not prov_path or not os.path.exists(prov_path):
+            results[bid] = (False, f"Could not obtain profile for {bid}: {message}", False)
+            continue
+        profiles_to_install.append((bid, prov_path, message, extended))
+
+    if not profiles_to_install:
+        return results
+
+    if not ld:
+        for bid, _, message, _ in profiles_to_install:
+            results[bid] = (False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False)
+        return results
 
     try:
-        ld = await get_lockdown_client()
-        if not ld:
-            return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
-
         async with MisagentService(ld) as mis:
-            # SideStore mechanic: Cleanly remove any existing old/expired profiles for this app
-            # to prevent duplicate profile accumulation that blocks launching
-            target_ids = {bundle_id, f"{bundle_id}.{TEAM_ID}", f"{TEAM_ID}.{bundle_id}"}
             existing_profiles = await mis.copy_all()
+            existing_by_uuid = {}
             for p in existing_profiles:
                 pl = p.plist
+                u = pl.get("UUID")
                 appid = pl.get("Entitlements", {}).get("application-identifier", "")
-                if any(t in appid for t in target_ids):
-                    old_uuid = pl.get("UUID")
-                    if old_uuid:
-                        try:
-                            await mis.remove(old_uuid)
-                        except Exception:
-                            pass
+                if u:
+                    existing_by_uuid[u] = appid
 
-            # Install the fresh profile from Apple
-            with open(prov_path, "rb") as f:
-                res = await mis.install(f)
-                if res.get("Status") == 0:
-                    return True, message, extended
+            old_uuids_to_remove = set()
+
+            # 1. Install fresh profiles FIRST so developer certificate count NEVER drops to 0
+            for bid, prov_path, message, extended in profiles_to_install:
+                new_uuid, _ = extract_profile_info(prov_path)
+
+                if new_uuid and new_uuid in existing_by_uuid:
+                    # Already present and active on device!
+                    results[bid] = (True, message, extended)
                 else:
-                    return False, f"misagent error: {res}", False
+                    try:
+                        with open(prov_path, "rb") as f:
+                            res = await mis.install(f)
+                        if res.get("Status") == 0:
+                            results[bid] = (True, message, extended)
+                            if new_uuid:
+                                existing_by_uuid[new_uuid] = bid
+                        else:
+                            results[bid] = (False, f"misagent error: {res}", False)
+                    except Exception as ex:
+                        results[bid] = (False, f"misagent install error: {ex}", False)
+
+                # Identify old superseded UUIDs for this app
+                if new_uuid:
+                    target_ids = {bid, f"{bid}.{TEAM_ID}", f"{TEAM_ID}.{bid}"}
+                    for u, appid in existing_by_uuid.items():
+                        if u != new_uuid and any(t in appid for t in target_ids):
+                            old_uuids_to_remove.add(u)
+
+            # 2. Only remove older superseded profile UUIDs AFTER the new profiles are securely installed
+            for old_u in old_uuids_to_remove:
+                try:
+                    await mis.remove(old_u)
+                except Exception:
+                    pass
+
     except Exception as e:
-        return False, str(e), False
+        for bid, _, _, _ in profiles_to_install:
+            if bid not in results:
+                results[bid] = (False, f"misagent session error: {e}", False)
+
+    return results
+
+async def push_certificate_profile_only(bundle_id: str, force: bool = True) -> tuple[bool, str, bool]:
+    res = await batch_push_certificate_profiles([bundle_id], force=force)
+    return res.get(bundle_id, (False, "Unknown error refreshing profile", False))
 
 async def wireless_sign_and_install(ipa_path: str, custom_bundle_id: Optional[str] = None):
     orig_bundle_id, app_name, version = extract_ipa_metadata(ipa_path)
@@ -700,17 +779,29 @@ async def refresh_all(request: Request):
             if fname.endswith(".mobileprovision"):
                 bid = fname[:-len(".mobileprovision")]
                 bundle_ids_to_refresh.add(bid)
-                
-    try:
-        ld = await get_lockdown_client()
-        if ld:
-            async with InstallationProxyService(ld) as ips:
-                apps = await ips.get_apps(application_type="User")
-                for bid, info in apps.items():
-                    if (TEAM_ID and TEAM_ID in bid) or info.get("ProfileValidated"):
-                        bundle_ids_to_refresh.add(bid)
-    except Exception:
-        pass
+
+    if CACHED_APPS_LIST:
+        for app in CACHED_APPS_LIST:
+            bid = app.get("bundle_id")
+            if bid:
+                bundle_ids_to_refresh.add(bid)
+    elif not bundle_ids_to_refresh:
+        try:
+            ld = await get_lockdown_client()
+            if ld:
+                async with InstallationProxyService(ld) as ips:
+                    apps = await ips.get_apps(application_type="User")
+                    for bid, info in apps.items():
+                        if (TEAM_ID and TEAM_ID in bid) or info.get("ProfileValidated"):
+                            bundle_ids_to_refresh.add(bid)
+        except Exception:
+            pass
+
+    force_param = request.query_params.get("force", "").lower() in ["1", "true"]
+    needing_apple = get_apps_needing_refresh(threshold_hours=AUTO_REFRESH_THRESHOLD_HOURS)
+    should_force = force_param or bool(needing_apple)
+
+    batch_results = await batch_push_certificate_profiles(list(bundle_ids_to_refresh), force=should_force)
 
     renewed_apps = []
     already_active_apps = []
@@ -719,7 +810,7 @@ async def refresh_all(request: Request):
     for bid in bundle_ids_to_refresh:
         parts = [p for p in bid.split(".") if p != TEAM_ID]
         clean_name = parts[-1].capitalize() if parts else "App"
-        success, message, renewed = await push_certificate_profile_only(bid)
+        success, message, renewed = batch_results.get(bid, (False, "App not processed", False))
         if success and renewed:
             renewed_apps.append(clean_name)
         elif success and not renewed:
@@ -733,7 +824,7 @@ async def refresh_all(request: Request):
     if renewed_apps:
         msg = f"Renewed (7 days): {', '.join(sorted(set(renewed_apps)))}!"
         if already_active_apps:
-            msg += f" (Already valid: {', '.join(sorted(set(already_active_apps)))})"
+            msg += f" (Refreshed on device: {', '.join(sorted(set(already_active_apps)))})"
         return {"success": True, "message": msg}
     elif already_active_apps:
         min_days = 7
@@ -745,7 +836,7 @@ async def refresh_all(request: Request):
                     d = max(0, (exp - now).days)
                     if d < min_days:
                         min_days = d
-        msg = f"All apps are active and up to date ({min_days}d left)."
+        msg = f"Refreshed on device ({min_days}d left): {', '.join(sorted(set(already_active_apps)))}!"
         return {"success": True, "message": msg}
     else:
         err_detail = "; ".join(failed_apps) if failed_apps else "Ensure iPhone screen is awake and connected to home Wi-Fi or SSTP VPN."
@@ -769,7 +860,16 @@ async def refresh_single_app(request: Request, bundle_id: str = Form(...)):
         LAST_KNOWN_IP = client_ip.strip()
         save_last_known_ip(LAST_KNOWN_IP)
 
-    success, message, renewed = await push_certificate_profile_only(bundle_id)
+    force_param = request.query_params.get("force", "").lower() in ["1", "true"]
+    prov_path = os.path.join(PROFILES_DIR, f"{bundle_id}.mobileprovision")
+    if not os.path.exists(prov_path):
+        prov_path = os.path.join(PROFILES_DIR, f"{bundle_id}.{TEAM_ID}.mobileprovision")
+    exp = extract_profile_expiration(prov_path)
+    now = datetime.now(timezone.utc)
+    hours_left = (exp - now).total_seconds() / 3600.0 if exp else 0.0
+    should_force = force_param or (hours_left <= AUTO_REFRESH_THRESHOLD_HOURS)
+
+    success, message, renewed = await push_certificate_profile_only(bundle_id, force=should_force)
     CACHED_APPS_TIMESTAMP = 0.0
     gc.collect()
     if success:
@@ -787,6 +887,8 @@ LAST_AUTO_REFRESH_TIME = 0.0
 AUTO_REFRESH_THRESHOLD_HOURS = 60.0  # Only auto-refresh if <= 2.5 days left
 AUTO_REFRESH_ROUTINE_INTERVAL = 12 * 3600  # Routine check interval (12 hours)
 AUTO_REFRESH_MIN_COOLDOWN = 3600  # Minimum 1 hour between any auto-refresh attempts
+LAST_PREFETCH_TIME = 0.0
+PREFETCH_INTERVAL = 6 * 3600  # Check Apple developer portal every 6 hours
 
 def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOURS) -> list[str]:
     """Check profiles directory and return bundle IDs that have <= threshold_hours remaining or are missing/invalid."""
@@ -804,6 +906,28 @@ def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOU
                     if hours_left <= threshold_hours:
                         needing.append(bid)
     return needing
+
+async def prefetch_expiring_profiles_if_needed():
+    """Pre-downloads expiring profiles from Apple Developer portal in the background so on-Wi-Fi push is instant (<2s)."""
+    global LAST_PREFETCH_TIME
+    now_ts = time.time()
+    if now_ts - LAST_PREFETCH_TIME < PREFETCH_INTERVAL:
+        return
+    needing = get_apps_needing_refresh(threshold_hours=AUTO_REFRESH_THRESHOLD_HOURS)
+    if needing:
+        print(f"[Profile Pre-fetch] Pre-fetching {len(needing)} expiring profile(s) from Apple in background: {needing}", flush=True)
+        def _fetch_app(bid: str):
+            parts = [p for p in bid.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
+            clean_name = parts[-1].capitalize() if parts else "App"
+            return bid, fetch_fresh_provisioning_profile_from_apple(bid, clean_name, force=True)
+
+        tasks = [asyncio.to_thread(_fetch_app, bid) for bid in needing]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            print(f"[Profile Pre-fetch] Background pre-fetch completed: {results}", flush=True)
+        except Exception as e:
+            print(f"[Profile Pre-fetch] Error during pre-fetch: {e}", flush=True)
+    LAST_PREFETCH_TIME = now_ts
 
 async def device_network_watcher_loop():
     global LAST_AUTO_REFRESH_TIME
@@ -849,23 +973,30 @@ async def device_network_watcher_loop():
                         LAST_AUTO_REFRESH_TIME = now_ts
                     else:
                         print(f"[Device Watcher] iPhone detected online at {LAST_KNOWN_IP}. Apps needing renewal: {needing_apps}", flush=True)
-                        await asyncio.sleep(5)  # Let connection stabilize
                         
-                        ld = await get_lockdown_client()
+                        # Fast probe with short retry instead of waiting hardcoded 5 seconds
+                        ld = None
+                        for _ in range(4):
+                            ld = await get_lockdown_client()
+                            if ld:
+                                break
+                            await asyncio.sleep(0.5)
+                        
                         if ld:
-                            print(f"[Device Watcher] Running automatic background refresh for {len(needing_apps)} app(s)...", flush=True)
+                            print(f"[Device Watcher] Running fast batch background refresh for {len(needing_apps)} app(s)...", flush=True)
                             LAST_AUTO_REFRESH_TIME = now_ts
-                            for bid in needing_apps:
-                                try:
-                                    s, m, renewed = await push_certificate_profile_only(bid, force=False)
-                                    print(f"[Device Watcher] Auto-refresh {bid}: {m}", flush=True)
-                                except Exception as ex:
-                                    print(f"[Device Watcher] Auto-refresh {bid} error: {ex}", flush=True)
+                            batch_results = await batch_push_certificate_profiles(needing_apps, force=False, pre_connected_ld=ld)
+                            for bid, (s, m, renewed) in batch_results.items():
+                                print(f"[Device Watcher] Auto-refresh {bid}: {m} (Success={s})", flush=True)
+
             else:
                 consecutive_offline += 1
                 # Only mark offline after 3 consecutive failed probes (~2.25 minutes)
                 if consecutive_offline >= 3:
                     was_online = False
+
+            # Check and pre-fetch expiring profiles from Apple in the background
+            await prefetch_expiring_profiles_if_needed()
                     
         except Exception as e:
             print("[Device Watcher] Error in watcher loop:", e, flush=True)

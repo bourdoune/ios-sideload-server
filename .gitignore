@@ -37,3 +37,4 @@ tg_config.json
 *.log
 .DS_Store
 static/icons/
+context.md
