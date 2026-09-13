@@ -8,6 +8,7 @@ import plistlib
 import socket
 import struct
 import time
+import threading
 import gc
 from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, Form, Request
@@ -39,6 +40,8 @@ KEY_PEM = os.getenv("KEY_PEM", os.path.expanduser("~/.config/Sideloader/keys/key
 CERT_PEM = os.path.join(BASE_DIR, "cert.pem")
 DEFAULT_APP_IPA = os.path.join(BASE_DIR, "app.ipa")
 
+_SIDELOADER_LOCK = threading.Lock()
+
 def ensure_sideloader_device_config():
     """Ensure ~/.config/Sideloader/device.json uses clean clientInfo without Xcode suffix to prevent HTTP 503 from Apple."""
     conf_dir = os.path.expanduser("~/.config/Sideloader")
@@ -51,8 +54,10 @@ def ensure_sideloader_device_config():
             ci = d.get("clientInfo", "")
             if "com.apple.dt.Xcode" in ci or not ci:
                 d["clientInfo"] = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1>"
-                with open(dev_path, "w") as f:
+                tmp_path = dev_path + ".tmp"
+                with open(tmp_path, "w") as f:
                     _json.dump(d, f)
+                os.replace(tmp_path, dev_path)
         except Exception as e:
             print(f"Error sanitizing device.json: {e}")
 ensure_sideloader_device_config()
@@ -351,22 +356,23 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
 
     auth_input = f"{APPLE_ID}\n"
 
-    cmd_dl = [SIDELOADER_BIN, "app-id", "download", "-i", "--team", TEAM_ID, "-o", tmp_dl_path, registered_id]
-    try:
-        res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=40)
-    except subprocess.TimeoutExpired:
-        res_dl = subprocess.CompletedProcess(cmd_dl, -1, stdout="", stderr="Timeout downloading profile")
-
-    out_dl = (res_dl.stdout or "") + (res_dl.stderr or "")
-    # Only try 'app-id add' if the app ID was not found / unregistered, NOT on 503, rate-limits, or timeouts
-    is_transient_error = "503" in out_dl or "rate limit" in out_dl.lower() or res_dl.returncode == -11
-    if (res_dl.returncode != 0 or not os.path.exists(tmp_dl_path)) and not is_transient_error and not os.path.exists(prov_path):
-        cmd_add = [SIDELOADER_BIN, "app-id", "add", "-i", "--team", TEAM_ID, app_name, registered_id]
+    with _SIDELOADER_LOCK:
+        cmd_dl = [SIDELOADER_BIN, "app-id", "download", "-i", "--team", TEAM_ID, "-o", tmp_dl_path, registered_id]
         try:
-            subprocess.run(cmd_add, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=20)
-            res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=20)
+            res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=40)
         except subprocess.TimeoutExpired:
-            pass
+            res_dl = subprocess.CompletedProcess(cmd_dl, -1, stdout="", stderr="Timeout downloading profile")
+
+        out_dl = (res_dl.stdout or "") + (res_dl.stderr or "")
+        # Only try 'app-id add' if the app ID was not found / unregistered, NOT on 503, rate-limits, or timeouts
+        is_transient_error = "503" in out_dl or "rate limit" in out_dl.lower() or res_dl.returncode == -11
+        if (res_dl.returncode != 0 or not os.path.exists(tmp_dl_path)) and not is_transient_error and not os.path.exists(prov_path):
+            cmd_add = [SIDELOADER_BIN, "app-id", "add", "-i", "--team", TEAM_ID, app_name, registered_id]
+            try:
+                subprocess.run(cmd_add, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=20)
+                res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=20)
+            except subprocess.TimeoutExpired:
+                pass
 
     if res_dl.returncode == 0 and os.path.exists(tmp_dl_path) and os.path.getsize(tmp_dl_path) > 0:
         new_exp = extract_profile_expiration(tmp_dl_path)
@@ -427,13 +433,13 @@ async def batch_push_certificate_profiles(
     unique_bids = list(dict.fromkeys(bundle_ids))
     results: dict[str, tuple[bool, str, bool]] = {}
 
-    def _fetch_app(bid: str):
-        parts = [p for p in bid.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
-        clean_name = parts[-1].capitalize() if parts else "App"
-        return bid, fetch_fresh_provisioning_profile_from_apple(bid, clean_name, force=force)
-
-    # Launch parallel downloads in thread pool
-    fetch_tasks = [asyncio.to_thread(_fetch_app, bid) for bid in unique_bids]
+    def _fetch_all_profiles():
+        items = []
+        for bid in unique_bids:
+            parts = [p for p in bid.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
+            clean_name = parts[-1].capitalize() if parts else "App"
+            items.append((bid, fetch_fresh_provisioning_profile_from_apple(bid, clean_name, force=force)))
+        return items
 
     async def _get_ld():
         if pre_connected_ld is not None:
@@ -441,7 +447,7 @@ async def batch_push_certificate_profiles(
         return await get_lockdown_client()
 
     # Pipeline Apple downloads and device connection concurrently
-    download_future = asyncio.gather(*fetch_tasks, return_exceptions=True)
+    download_future = asyncio.to_thread(_fetch_all_profiles)
     ld_future = _get_ld()
 
     fetched_items, ld = await asyncio.gather(download_future, ld_future)
@@ -916,14 +922,16 @@ async def prefetch_expiring_profiles_if_needed():
     needing = get_apps_needing_refresh(threshold_hours=AUTO_REFRESH_THRESHOLD_HOURS)
     if needing:
         print(f"[Profile Pre-fetch] Pre-fetching {len(needing)} expiring profile(s) from Apple in background: {needing}", flush=True)
-        def _fetch_app(bid: str):
-            parts = [p for p in bid.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
-            clean_name = parts[-1].capitalize() if parts else "App"
-            return bid, fetch_fresh_provisioning_profile_from_apple(bid, clean_name, force=True)
+        def _fetch_all():
+            items = []
+            for bid in needing:
+                parts = [p for p in bid.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
+                clean_name = parts[-1].capitalize() if parts else "App"
+                items.append((bid, fetch_fresh_provisioning_profile_from_apple(bid, clean_name, force=True)))
+            return items
 
-        tasks = [asyncio.to_thread(_fetch_app, bid) for bid in needing]
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.to_thread(_fetch_all)
             print(f"[Profile Pre-fetch] Background pre-fetch completed: {results}", flush=True)
         except Exception as e:
             print(f"[Profile Pre-fetch] Error during pre-fetch: {e}", flush=True)
