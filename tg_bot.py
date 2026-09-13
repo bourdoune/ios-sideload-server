@@ -156,7 +156,7 @@ def get_main_keyboard(apps):
     for app in apps:
         clean_name = app.get("name", "App")
         bid = app.get("bundle_id")
-        app_buttons.append({"text": f"⚡ Renew {clean_name}", "callback_data": f"ref_force:{bid}"})
+        app_buttons.append({"text": f"🔄 {clean_name}", "callback_data": f"ref:{bid}"})
     if app_buttons:
         # Group in pairs
         grouped = [app_buttons[i:i+2] for i in range(0, len(app_buttons), 2)]
@@ -253,11 +253,24 @@ async def handle_update(session: aiohttp.ClientSession, update: dict, config: di
             apps = await get_apps_list(session)
             await send_tg_message(session, chat_id, format_status_message(status, apps), reply_markup=get_main_keyboard(apps))
 
-        elif data.startswith("ref_force:") or data.startswith("ref:"):
-            bundle_id = data.split(":", 1)[1]
-            await answer_callback_query(session, cb_id, "Force renewing app from Apple...")
-            await send_tg_message(session, chat_id, f"⏳ <i>Contacting Apple & renewing app ({bundle_id})...</i>")
+        elif data.startswith("ref_force:"):
+            bundle_id = data[10:]
+            await answer_callback_query(session, cb_id, "Force renewing from Apple...")
+            await send_tg_message(session, chat_id, f"⏳ <i>Contacting Apple & renewing ({bundle_id})...</i>")
             res = await trigger_refresh_app(session, bundle_id, force=True)
+            if res.get("success"):
+                await send_tg_message(session, chat_id, f"✅ {res.get('message')}")
+            else:
+                await send_tg_message(session, chat_id, f"❌ {res.get('message')}")
+            status = await get_device_status(session)
+            apps = await get_apps_list(session)
+            await send_tg_message(session, chat_id, format_status_message(status, apps), reply_markup=get_main_keyboard(apps))
+
+        elif data.startswith("ref:"):
+            bundle_id = data[4:]
+            await answer_callback_query(session, cb_id, "Refreshing app...")
+            await send_tg_message(session, chat_id, f"⏳ <i>Refreshing app ({bundle_id})...</i>")
+            res = await trigger_refresh_app(session, bundle_id, force=False)
             if res.get("success"):
                 await send_tg_message(session, chat_id, f"✅ {res.get('message')}")
             else:
