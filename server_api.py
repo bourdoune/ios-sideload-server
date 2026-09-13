@@ -413,70 +413,36 @@ async def push_certificate_profile_only(bundle_id: str, force: bool = True) -> t
     if not extended and not force:
         return True, message, False
 
-    # Look for cached base IPA in installed_apps
-    base_ipa = os.path.join(BASE_DIR, "installed_apps", f"{bundle_id}.ipa")
-    if not os.path.exists(base_ipa):
-        # Also check fallback locations (e.g. LiveContainer.ipa)
-        if "livecontainer" in bundle_id.lower():
-            cand = os.path.join(BASE_DIR, "LiveContainer.ipa")
-            if os.path.exists(cand):
-                base_ipa = cand
+    try:
+        ld = await get_lockdown_client()
+        if not ld:
+            return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
 
-    if os.path.exists(base_ipa):
-        # Full app refresh: re-sign IPA with fresh profile and install via InstallationProxyService
-        with tempfile.NamedTemporaryFile(suffix=".ipa", delete=False) as tmp_signed:
-            signed_ipa = tmp_signed.name
+        async with MisagentService(ld) as mis:
+            # SideStore mechanic: Cleanly remove any existing old/expired profiles for this app
+            # to prevent duplicate profile accumulation that blocks launching
+            target_ids = {bundle_id, f"{bundle_id}.{TEAM_ID}", f"{TEAM_ID}.{bundle_id}"}
+            existing_profiles = await mis.copy_all()
+            for p in existing_profiles:
+                pl = p.plist
+                appid = pl.get("Entitlements", {}).get("application-identifier", "")
+                if any(t in appid for t in target_ids):
+                    old_uuid = pl.get("UUID")
+                    if old_uuid:
+                        try:
+                            await mis.remove(old_uuid)
+                        except Exception:
+                            pass
 
-        try:
-            cmd = [
-                ZSIGN_BIN,
-                "-k", KEY_PEM,
-                "-c", CERT_PEM,
-                "-m", prov_path,
-                "-b", bundle_id,
-                "-o", signed_ipa,
-                base_ipa
-            ]
-            res = subprocess.run(cmd, cwd=BASE_DIR, capture_output=True, text=True)
-            if res.returncode != 0:
-                return False, f"Signing error during refresh:\n{res.stdout}\n{res.stderr}", False
-
-            ld = await get_lockdown_client()
-            if not ld:
-                return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
-
-            async with InstallationProxyService(ld) as ips:
-                await ips.install_from_local(signed_ipa)
-
-            # Also install profile via misagent to keep system cache in sync
-            try:
-                async with MisagentService(ld) as mis:
-                    with open(prov_path, "rb") as f:
-                        await mis.install(f)
-            except Exception:
-                pass
-
-            return True, f"{clean_name} renewed and re-installed (7 days renewed)!", True
-        except Exception as e:
-            return False, f"Error updating {clean_name}: {e}", False
-        finally:
-            if os.path.exists(signed_ipa):
-                os.remove(signed_ipa)
-    else:
-        # Fallback if base IPA is missing: push profile via misagent and prompt user
-        try:
-            ld = await get_lockdown_client()
-            if not ld:
-                return False, f"{message} (iPhone is offline over Wi-Fi/VPN)", False
-            async with MisagentService(ld) as mis:
-                with open(prov_path, "rb") as f:
-                    res = await mis.install(f)
-                    if res.get("Status") == 0:
-                        return True, f"{message} (Base IPA not found on server; re-upload {clean_name} once to enable automatic app re-installation)", extended
-                    else:
-                        return False, f"misagent error: {res}", False
-        except Exception as e:
-            return False, str(e), False
+            # Install the fresh profile from Apple
+            with open(prov_path, "rb") as f:
+                res = await mis.install(f)
+                if res.get("Status") == 0:
+                    return True, message, extended
+                else:
+                    return False, f"misagent error: {res}", False
+    except Exception as e:
+        return False, str(e), False
 
 async def wireless_sign_and_install(ipa_path: str, custom_bundle_id: Optional[str] = None):
     orig_bundle_id, app_name, version = extract_ipa_metadata(ipa_path)
