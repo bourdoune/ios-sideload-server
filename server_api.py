@@ -41,6 +41,7 @@ CERT_PEM = os.path.join(BASE_DIR, "cert.pem")
 DEFAULT_APP_IPA = os.path.join(BASE_DIR, "app.ipa")
 
 _SIDELOADER_LOCK = threading.Lock()
+AUTO_REFRESH_THRESHOLD_HOURS = 120.0  # Renew if < 5 days (120 hours) left
 
 def ensure_sideloader_device_config():
     """Ensure ~/.config/Sideloader/device.json uses clean clientInfo without Xcode suffix to prevent HTTP 503 from Apple."""
@@ -332,12 +333,12 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
 
     existing_exp = extract_profile_expiration(prov_path)
 
-    # When not forcing renewal, preserve existing profile if it has plenty of validity (> 60h / 2.5d)
+    # When not forcing renewal, preserve existing profile if it has plenty of validity (>= 5 days / 120h)
     if not force and existing_exp:
         now = datetime.now(timezone.utc)
         delta = existing_exp - now
         hours_left = delta.total_seconds() / 3600.0
-        if hours_left > 60.0:
+        if hours_left >= AUTO_REFRESH_THRESHOLD_HOURS:
             days = max(0, delta.days)
             hours = max(0, delta.seconds // 3600)
             exp_str = existing_exp.strftime("%b %d, %H:%M")
@@ -488,7 +489,7 @@ async def batch_push_certificate_profiles(
             for bid, prov_path, message, extended in profiles_to_install:
                 new_uuid, _ = extract_profile_info(prov_path)
 
-                if not force and new_uuid and new_uuid in existing_by_uuid:
+                if not force and not extended and new_uuid and new_uuid in existing_by_uuid:
                     # Already present and active on device!
                     results[bid] = (True, message, extended)
                 else:
@@ -741,7 +742,40 @@ async def get_apps(force: bool = False):
     return sideloaded_apps
 
 def fallback_apps():
-    return []
+    apps = []
+    if os.path.exists(PROFILES_DIR):
+        now = datetime.now(timezone.utc)
+        for fname in sorted(os.listdir(PROFILES_DIR)):
+            if fname.endswith(".mobileprovision"):
+                bid = fname[:-len(".mobileprovision")]
+                prov_path = os.path.join(PROFILES_DIR, fname)
+                exp_date = extract_profile_expiration(prov_path)
+                parts = [p for p in bid.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
+                app_name = parts[-1].capitalize() if parts else "App"
+                if exp_date:
+                    delta = exp_date - now
+                    total_hours = max(0, int(delta.total_seconds() // 3600))
+                    days = total_hours // 24
+                    hours = total_hours % 24
+                    time_left_str = f"{days}d {hours}h left" if days > 0 else f"{hours}h left"
+                    pct = max(0, min(100, int((delta.total_seconds() / (7 * 86400)) * 100)))
+                    exp_str = exp_date.strftime("%b %d, %H:%M")
+                else:
+                    days, total_hours, time_left_str, pct, exp_str = 0, 0, "Needs Refresh", 0, "No Profile"
+                icon_file = os.path.join(ICONS_DIR, f"{bid}.png")
+                icon_url = f"/static/icons/{bid}.png" if os.path.exists(icon_file) and os.path.getsize(icon_file) > 0 else None
+                apps.append({
+                    "bundle_id": bid,
+                    "name": app_name,
+                    "version": "1.0",
+                    "icon_url": icon_url,
+                    "days_left": days,
+                    "hours_left": total_hours,
+                    "time_left_str": time_left_str,
+                    "percent_remaining": pct,
+                    "expires_at": exp_str
+                })
+    return apps
 
 @app.post("/api/set-ip")
 async def set_device_ip(request: Request):
@@ -873,7 +907,7 @@ async def refresh_single_app(request: Request, bundle_id: str = Form(...)):
     exp = extract_profile_expiration(prov_path)
     now = datetime.now(timezone.utc)
     hours_left = (exp - now).total_seconds() / 3600.0 if exp else 0.0
-    should_force = force_param or (hours_left <= AUTO_REFRESH_THRESHOLD_HOURS)
+    should_force = force_param or (hours_left < AUTO_REFRESH_THRESHOLD_HOURS)
 
     success, message, renewed = await push_certificate_profile_only(bundle_id, force=should_force)
     CACHED_APPS_TIMESTAMP = 0.0
@@ -890,14 +924,13 @@ async def refresh_single_app(request: Request, bundle_id: str = Form(...)):
         )
 
 LAST_AUTO_REFRESH_TIME = 0.0
-AUTO_REFRESH_THRESHOLD_HOURS = 60.0  # Only auto-refresh if <= 2.5 days left
 AUTO_REFRESH_ROUTINE_INTERVAL = 12 * 3600  # Routine check interval (12 hours)
 AUTO_REFRESH_MIN_COOLDOWN = 3600  # Minimum 1 hour between any auto-refresh attempts
 LAST_PREFETCH_TIME = 0.0
 PREFETCH_INTERVAL = 12 * 3600  # Check and pre-fetch from Apple developer portal every 12 hours
 
 def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOURS) -> list[str]:
-    """Check profiles directory and return bundle IDs that have <= threshold_hours remaining or are missing/invalid."""
+    """Check profiles directory and return bundle IDs that have < threshold_hours remaining or are missing/invalid."""
     needing = []
     known_bids = set()
     now = datetime.now(timezone.utc)
@@ -911,7 +944,7 @@ def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOU
                     needing.append(bid)
                 else:
                     hours_left = (exp - now).total_seconds() / 3600.0
-                    if hours_left <= threshold_hours:
+                    if hours_left < threshold_hours:
                         needing.append(bid)
     if CACHED_APPS_LIST:
         for app in CACHED_APPS_LIST:
@@ -976,15 +1009,15 @@ async def device_network_watcher_loop():
                 
                 if (just_connected or routine_check_due) and cooldown_passed:
                     is_wifi_lan = LAST_KNOWN_IP.startswith("192.168.")
-                    # On VPN/cellular, defer heavy background re-installs unless urgently expiring (<= 12h left) to conserve mobile data
-                    effective_threshold = AUTO_REFRESH_THRESHOLD_HOURS if is_wifi_lan else 12.0
+                    # On VPN/cellular, defer heavy background re-installs unless urgently expiring (<= 24h left) to conserve mobile data
+                    effective_threshold = AUTO_REFRESH_THRESHOLD_HOURS if is_wifi_lan else 24.0
                     needing_apps = get_apps_needing_refresh(threshold_hours=effective_threshold)
                     
                     if not needing_apps:
                         if not is_wifi_lan:
                             print(f"[Device Watcher] iPhone connected via VPN ({LAST_KNOWN_IP}). Deferring heavy background auto-refresh until connected to Home Wi-Fi.", flush=True)
                         else:
-                            print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP}. All profiles have >{AUTO_REFRESH_THRESHOLD_HOURS/24:.1f}d remaining. Skipping auto-refresh.", flush=True)
+                            print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP}. All profiles have >={AUTO_REFRESH_THRESHOLD_HOURS/24:.0f}d remaining. Skipping auto-refresh.", flush=True)
                         LAST_AUTO_REFRESH_TIME = now_ts
                     else:
                         print(f"[Device Watcher] iPhone detected online at {LAST_KNOWN_IP}. Apps needing renewal: {needing_apps}", flush=True)
