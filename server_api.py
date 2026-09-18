@@ -927,7 +927,7 @@ LAST_AUTO_REFRESH_TIME = 0.0
 AUTO_REFRESH_ROUTINE_INTERVAL = 12 * 3600  # Routine check interval (12 hours)
 AUTO_REFRESH_MIN_COOLDOWN = 3600  # Minimum 1 hour between any auto-refresh attempts
 LAST_PREFETCH_TIME = 0.0
-PREFETCH_INTERVAL = 12 * 3600  # Check and pre-fetch from Apple developer portal every 12 hours
+PREFETCH_INTERVAL = 24 * 3600  # Check and renew from Apple developer portal into local storage every 24 hours
 
 def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOURS) -> list[str]:
     """Check profiles directory and return bundle IDs that have < threshold_hours remaining or are missing/invalid."""
@@ -953,18 +953,109 @@ def get_apps_needing_refresh(threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOU
                 needing.append(bid)
     return list(dict.fromkeys(needing))
 
+async def get_device_apps_needing_renewal(ld, threshold_hours: float = AUTO_REFRESH_THRESHOLD_HOURS) -> list[str]:
+    """
+    Inspects certificates installed directly on the iPhone.
+    Returns bundle IDs where the on-device certificate has < threshold_hours (< 5 days) remaining,
+    or is missing from the device, so they can be renewed locally from pre-fetched certs.
+    """
+    needing = []
+    if not ld:
+        return needing
+
+    now = datetime.now(timezone.utc)
+    device_expirations = {}
+    try:
+        async with MisagentService(ld) as mis:
+            profiles = await mis.copy_all()
+            for p in profiles:
+                pl = p.plist
+                appid = pl.get("Entitlements", {}).get("application-identifier", "")
+                exp = pl.get("ExpirationDate")
+                if appid and exp:
+                    clean_id = appid.replace(f"{TEAM_ID}.", "")
+                    if clean_id not in device_expirations or exp > device_expirations[clean_id]:
+                        device_expirations[clean_id] = exp
+                    device_expirations[appid] = exp
+    except Exception as e:
+        print(f"[Device Watcher] Error querying device profiles: {e}", flush=True)
+        return get_apps_needing_refresh(threshold_hours=threshold_hours)
+
+    known_apps = set()
+    if os.path.exists(PROFILES_DIR):
+        for fname in os.listdir(PROFILES_DIR):
+            if fname.endswith(".mobileprovision"):
+                bid = fname[:-len(".mobileprovision")]
+                known_apps.add(bid)
+    if CACHED_APPS_LIST:
+        for a in CACHED_APPS_LIST:
+            bid = a.get("bundle_id")
+            if bid:
+                known_apps.add(bid)
+
+    for bid in known_apps:
+        dev_exp = device_expirations.get(bid)
+        if not dev_exp and TEAM_ID:
+            dev_exp = device_expirations.get(f"{bid}.{TEAM_ID}") or device_expirations.get(f"{TEAM_ID}.{bid}")
+
+        if not dev_exp:
+            # Profile completely missing on device
+            needing.append(bid)
+            continue
+
+        if dev_exp.tzinfo is None:
+            dev_exp = dev_exp.replace(tzinfo=timezone.utc)
+
+        hours_left_on_device = (dev_exp - now).total_seconds() / 3600.0
+        if hours_left_on_device < threshold_hours:
+            # On-device certificate has < 5 days remaining!
+            needing.append(bid)
+
+    return list(dict.fromkeys(needing))
+
 async def prefetch_expiring_profiles_if_needed():
-    """Pre-downloads expiring profiles from Apple Developer portal in the background so on-Wi-Fi push is instant (<2s)."""
+    """Daily backend prefetcher: connects to Apple every 24 hours to renew and store fresh 7-day profiles locally."""
     global LAST_PREFETCH_TIME
     now_ts = time.time()
-    if now_ts - LAST_PREFETCH_TIME < PREFETCH_INTERVAL:
+    if LAST_PREFETCH_TIME > 0 and (now_ts - LAST_PREFETCH_TIME < PREFETCH_INTERVAL):
         return
-    needing = get_apps_needing_refresh(threshold_hours=AUTO_REFRESH_THRESHOLD_HOURS)
-    if needing:
-        print(f"[Profile Pre-fetch] Pre-fetching {len(needing)} expiring profile(s) from Apple in background: {needing}", flush=True)
+
+    known_bids = set()
+    if os.path.exists(PROFILES_DIR):
+        for fname in os.listdir(PROFILES_DIR):
+            if fname.endswith(".mobileprovision"):
+                bid = fname[:-len(".mobileprovision")]
+                known_bids.add(bid)
+    if CACHED_APPS_LIST:
+        for app in CACHED_APPS_LIST:
+            bid = app.get("bundle_id")
+            if bid:
+                known_bids.add(bid)
+
+    if not known_bids:
+        return
+
+    now = datetime.now(timezone.utc)
+    # Check apps that need renewal from Apple (any local profile with <= 144h / 6 days left or missing)
+    apps_to_renew = []
+    for bid in known_bids:
+        prov_path = os.path.join(PROFILES_DIR, f"{bid}.mobileprovision")
+        if not os.path.exists(prov_path):
+            prov_path = os.path.join(PROFILES_DIR, f"{bid}.{TEAM_ID}.mobileprovision")
+        exp = extract_profile_expiration(prov_path) if os.path.exists(prov_path) else None
+        if not exp:
+            apps_to_renew.append(bid)
+        else:
+            hours_left = (exp - now).total_seconds() / 3600.0
+            # 7-day profile renewed 24h ago has ~144h left, so <= 144h triggers the daily 24h renewal from Apple
+            if hours_left <= 144.0:
+                apps_to_renew.append(bid)
+
+    if apps_to_renew:
+        print(f"[Daily Apple Prefetcher] Renewing {len(apps_to_renew)} profile(s) from Apple into local storage: {apps_to_renew}", flush=True)
         def _fetch_all():
             items = []
-            for bid in needing:
+            for bid in apps_to_renew:
                 parts = [p for p in bid.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
                 clean_name = parts[-1].capitalize() if parts else "App"
                 items.append((bid, fetch_fresh_provisioning_profile_from_apple(bid, clean_name, force=True)))
@@ -972,10 +1063,12 @@ async def prefetch_expiring_profiles_if_needed():
 
         try:
             results = await asyncio.to_thread(_fetch_all)
-            print(f"[Profile Pre-fetch] Background pre-fetch completed: {results}", flush=True)
+            print(f"[Daily Apple Prefetcher] Daily renewal completed: {results}", flush=True)
+            LAST_PREFETCH_TIME = now_ts
         except Exception as e:
-            print(f"[Profile Pre-fetch] Error during pre-fetch: {e}", flush=True)
-    LAST_PREFETCH_TIME = now_ts
+            print(f"[Daily Apple Prefetcher] Error during daily renewal: {e}", flush=True)
+    else:
+        LAST_PREFETCH_TIME = now_ts
 
 async def device_network_watcher_loop():
     global LAST_AUTO_REFRESH_TIME
@@ -1011,31 +1104,28 @@ async def device_network_watcher_loop():
                     is_wifi_lan = LAST_KNOWN_IP.startswith("192.168.")
                     # On VPN/cellular, defer heavy background re-installs unless urgently expiring (<= 24h left) to conserve mobile data
                     effective_threshold = AUTO_REFRESH_THRESHOLD_HOURS if is_wifi_lan else 24.0
-                    needing_apps = get_apps_needing_refresh(threshold_hours=effective_threshold)
-                    
-                    if not needing_apps:
-                        if not is_wifi_lan:
-                            print(f"[Device Watcher] iPhone connected via VPN ({LAST_KNOWN_IP}). Deferring heavy background auto-refresh until connected to Home Wi-Fi.", flush=True)
-                        else:
-                            print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP}. All profiles have >={AUTO_REFRESH_THRESHOLD_HOURS/24:.0f}d remaining. Skipping auto-refresh.", flush=True)
-                        LAST_AUTO_REFRESH_TIME = now_ts
-                    else:
-                        print(f"[Device Watcher] iPhone detected online at {LAST_KNOWN_IP}. Apps needing renewal: {needing_apps}", flush=True)
-                        
-                        # Fast probe with short retry instead of waiting hardcoded 5 seconds
-                        ld = None
-                        for _ in range(4):
-                            ld = await get_lockdown_client()
-                            if ld:
-                                break
-                            await asyncio.sleep(0.5)
-                        
+
+                    ld = None
+                    for _ in range(4):
+                        ld = await get_lockdown_client()
                         if ld:
-                            print(f"[Device Watcher] Running fast batch background refresh for {len(needing_apps)} app(s)...", flush=True)
+                            break
+                        await asyncio.sleep(0.5)
+
+                    if ld:
+                        needing_apps = await get_device_apps_needing_renewal(ld, threshold_hours=effective_threshold)
+                        if not needing_apps:
+                            if not is_wifi_lan:
+                                print(f"[Device Watcher] iPhone connected via VPN ({LAST_KNOWN_IP}). All on-device certs valid. Deferring until Home Wi-Fi.", flush=True)
+                            else:
+                                print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP}. All on-device profiles have >={effective_threshold/24:.0f}d remaining. Skipping auto-refresh.", flush=True)
+                            LAST_AUTO_REFRESH_TIME = now_ts
+                        else:
+                            print(f"[Device Watcher] On-device certs < {effective_threshold/24:.0f}d (or missing) for: {needing_apps}. Renewing locally from prefetched server certs...", flush=True)
                             LAST_AUTO_REFRESH_TIME = now_ts
                             batch_results = await batch_push_certificate_profiles(needing_apps, force=False, pre_connected_ld=ld)
                             for bid, (s, m, renewed) in batch_results.items():
-                                print(f"[Device Watcher] Auto-refresh {bid}: {m} (Success={s})", flush=True)
+                                print(f"[Device Watcher] Local sync result {bid}: {m} (Success={s})", flush=True)
 
             else:
                 consecutive_offline += 1
