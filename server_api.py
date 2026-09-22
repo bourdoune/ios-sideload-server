@@ -346,6 +346,25 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
 
     ensure_sideloader_device_config()
 
+    if app_name == "App" and os.path.exists(prov_path):
+        try:
+            with open(prov_path, "rb") as fp:
+                data = fp.read()
+            start = data.find(b"<?xml")
+            end = data.find(b"</plist>")
+            if start != -1 and end != -1:
+                p = plistlib.loads(data[start:end + 8])
+                found_name = p.get("AppIDName")
+                if found_name:
+                    app_name = found_name
+        except Exception:
+            pass
+
+    if app_name == "App":
+        parts = [p for p in registered_id.split(".") if p not in [TEAM_ID, "com", "ios", "app", "client"]]
+        if parts:
+            app_name = parts[-1].capitalize()
+
     env = os.environ.copy()
     env["HOME"] = os.path.expanduser("~")
     env["ALTSERVER_ANISETTE_SERVER"] = os.getenv("ALTSERVER_ANISETTE_SERVER", "http://127.0.0.1:6970")
@@ -367,11 +386,11 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
         out_dl = (res_dl.stdout or "") + (res_dl.stderr or "")
         # Only try 'app-id add' if the app ID was not found / unregistered, NOT on 503, rate-limits, or timeouts
         is_transient_error = "503" in out_dl or "rate limit" in out_dl.lower() or res_dl.returncode == -11
-        if (res_dl.returncode != 0 or not os.path.exists(tmp_dl_path)) and not is_transient_error and not os.path.exists(prov_path):
+        if (res_dl.returncode != 0 or not os.path.exists(tmp_dl_path)) and not is_transient_error:
             cmd_add = [SIDELOADER_BIN, "app-id", "add", "-i", "--team", TEAM_ID, app_name, registered_id]
             try:
-                subprocess.run(cmd_add, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=20)
-                res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=20)
+                subprocess.run(cmd_add, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=25)
+                res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=25)
             except subprocess.TimeoutExpired:
                 pass
 
@@ -1064,9 +1083,14 @@ async def prefetch_expiring_profiles_if_needed():
         try:
             results = await asyncio.to_thread(_fetch_all)
             print(f"[Daily Apple Prefetcher] Daily renewal completed: {results}", flush=True)
-            LAST_PREFETCH_TIME = now_ts
+            any_success = any(res[1] or ("Profile is already active" in (res[2] or "")) for _, res in results)
+            if any_success:
+                LAST_PREFETCH_TIME = now_ts
+            else:
+                LAST_PREFETCH_TIME = now_ts - PREFETCH_INTERVAL + 3600
         except Exception as e:
             print(f"[Daily Apple Prefetcher] Error during daily renewal: {e}", flush=True)
+            LAST_PREFETCH_TIME = now_ts - PREFETCH_INTERVAL + 3600
     else:
         LAST_PREFETCH_TIME = now_ts
 
@@ -1079,6 +1103,10 @@ async def device_network_watcher_loop():
     while True:
         try:
             await asyncio.sleep(45)
+
+            # Check and pre-fetch expiring profiles from Apple into local storage first
+            await prefetch_expiring_profiles_if_needed()
+
             if not LAST_KNOWN_IP:
                 continue
                 
@@ -1102,8 +1130,7 @@ async def device_network_watcher_loop():
                 
                 if (just_connected or routine_check_due) and cooldown_passed:
                     is_wifi_lan = LAST_KNOWN_IP.startswith("192.168.")
-                    # On VPN/cellular, defer heavy background re-installs unless urgently expiring (<= 24h left) to conserve mobile data
-                    effective_threshold = AUTO_REFRESH_THRESHOLD_HOURS if is_wifi_lan else 24.0
+                    effective_threshold = AUTO_REFRESH_THRESHOLD_HOURS
 
                     ld = None
                     for _ in range(4):
@@ -1115,10 +1142,7 @@ async def device_network_watcher_loop():
                     if ld:
                         needing_apps = await get_device_apps_needing_renewal(ld, threshold_hours=effective_threshold)
                         if not needing_apps:
-                            if not is_wifi_lan:
-                                print(f"[Device Watcher] iPhone connected via VPN ({LAST_KNOWN_IP}). All on-device certs valid. Deferring until Home Wi-Fi.", flush=True)
-                            else:
-                                print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP}. All on-device profiles have >={effective_threshold/24:.0f}d remaining. Skipping auto-refresh.", flush=True)
+                            print(f"[Device Watcher] iPhone online at {LAST_KNOWN_IP} ({'Home Wi-Fi' if is_wifi_lan else 'VPN'}). All on-device profiles have >={effective_threshold/24:.0f}d remaining. Skipping auto-refresh.", flush=True)
                             LAST_AUTO_REFRESH_TIME = now_ts
                         else:
                             print(f"[Device Watcher] On-device certs < {effective_threshold/24:.0f}d (or missing) for: {needing_apps}. Renewing locally from prefetched server certs...", flush=True)
@@ -1132,9 +1156,6 @@ async def device_network_watcher_loop():
                 # Only mark offline after 3 consecutive failed probes (~2.25 minutes)
                 if consecutive_offline >= 3:
                     was_online = False
-
-            # Check and pre-fetch expiring profiles from Apple in the background
-            await prefetch_expiring_profiles_if_needed()
                     
         except Exception as e:
             print("[Device Watcher] Error in watcher loop:", e, flush=True)
