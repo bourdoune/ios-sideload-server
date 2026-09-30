@@ -256,7 +256,7 @@ async def get_lockdown_client():
 
     try:
         return await asyncio.wait_for(
-            create_using_usbmux(serial=DEVICE_UDID, connection_type="Network"),
+            create_using_usbmux(serial=DEVICE_UDID or None),
             timeout=3.5
         )
     except Exception:
@@ -266,7 +266,7 @@ async def get_lockdown_client():
             await asyncio.sleep(0.4)
         try:
             return await asyncio.wait_for(
-                create_using_usbmux(serial=DEVICE_UDID, connection_type="Network"),
+                create_using_usbmux(serial=DEVICE_UDID or None),
                 timeout=3.5
             )
         except Exception:
