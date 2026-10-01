@@ -399,11 +399,6 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
         if new_exp:
             if not existing_exp or new_exp >= existing_exp or force:
                 shutil.move(tmp_dl_path, prov_path)
-                if "livecontainer" in registered_id.lower():
-                    try:
-                        shutil.copy2(prov_path, os.path.join(STATIC_DIR, "livecontainer.mobileprovision"))
-                    except Exception:
-                        pass
                 exp_str = new_exp.strftime("%b %d, %H:%M")
                 return prov_path, True, f"Renewed until {exp_str} UTC (7 days renewed)!"
             else:
