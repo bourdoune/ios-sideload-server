@@ -1,74 +1,68 @@
-<div align="center">
+# ios sideload and auto-refresh server
 
-# ⚡ iOS Sideload & Auto-Refresh Server
-
-### Seamless, Over-The-Air iOS App Sideloading & Automatic Wi-Fi Certificate Renewal
-
-[![Platform](https://img.shields.io/badge/platform-iOS%2016%20%7C%2017%20%7C%2018-black.svg?style=for-the-badge&logo=apple)](https://apple.com)
-[![FastAPI](https://img.shields.io/badge/FastAPI-005571?style=for-the-badge&logo=fastapi)](https://fastapi.tiangolo.com)
-[![Telegram Bot](https://img.shields.io/badge/Telegram-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://telegram.org)
-[![License](https://img.shields.io/badge/License-MIT-green.svg?style=for-the-badge)](LICENSE)
-
-<p align="center">
-  A self-hosted, all-in-one Linux service for sideloading iOS apps wirelessly without a Mac or AltServer on Windows. Featuring a sleek iOS-style PWA dashboard, background Wi-Fi profile auto-renewal (even while locked), and a real-time Telegram assistant bot.
-</p>
-
-</div>
+self-hosted linux service for over-the-air ios app sideloading and automatic provisioning profile renewal across local wi-fi and vpn connections without requiring a mac or altserver on windows.
 
 ---
 
-## ✨ Key Highlights
+## features
 
-- 🔄 **Automatic Background Wi-Fi Renewal**
-  No more 7-day expiration worries. The server automatically detects your iPhone when it joins your home Wi-Fi network and refreshes its provisioning profiles—**even when the device is locked in sleep mode**.
+- **automated background renewal**:
+  renews provisioning profiles directly on the device using `misagent` over the lockdown protocol. renewals push updated certificates (~12 kb payload) in under 2 seconds without re-signing or re-transferring full ipa packages.
 
-- ⚡ **Lightweight Payload (< 15 KB)**
-  Instead of re-signing and downloading massive multi-hundred megabyte `.ipa` files over Wi-Fi, renewals push updated Apple certificates directly to the device through `misagent` in under 2 seconds.
+- **dynamic ip detection**:
+  automatically detects and tracks the active device ip across local wi-fi subnets and vpn leases (e.g., sstp `172.16.3.x`) by probing apple lockdown port `62078`.
 
-- 📲 **Wireless IPA Sideloading**
-  Drag & drop or upload `.ipa` files directly from your browser or iPhone to have them signed and installed over the air.
+- **native apple portal client**:
+  pure-python implementation (`apple_portal/` and `apple_client.py`) for apple grandslam (gsa) authentication and developer portal interaction, replacing unstable third-party binary cli shims.
 
-- 📱 **Modern iOS PWA Dashboard**
-  A responsive web interface with live countdown timers, app battery/resource-friendly caching, one-tap manual refresh buttons, and standalone installation support (Add to Home Screen).
+- **secure session management**:
+  developer session tokens are cached under `~/.local/share/altserver-apple` with restricted permissions (`0700`). authentication failures pause background renewal routines safely to avoid account lockouts.
 
-- 🤖 **Telegram Assistant Bot**
-  Instant alerts before certificates expire, live status check command (`/status`), and inline buttons to trigger remote renewals from anywhere.
+- **interactive 2fa runner**:
+  `login_2fa.py` handles two-factor authentication when apple verification is required, reading six-digit codes from `/tmp/2fa_code` without recursive retry loops.
+
+- **web pwa dashboard & telegram bot**:
+  responsive web dashboard with real-time expiration countdowns, drag-and-drop ipa signing via `zsign`, and an asynchronous telegram bot (`tg_bot.py`) for remote status queries (`/status`) and manual renewal triggers.
 
 ---
 
-## 🏗️ Architecture
+## architecture
 
-```
-┌─────────────────┐       Wi-Fi / LAN       ┌───────────────────────────────┐
-│                 │ ◄─────────────────────► │          iOS Device           │
-│                 │      (netmuxd / mDNS)   │       (iOS 16+ / Apps)        │
-│                 │                         └───────────────────────────────┘
-│                 │                                  ▲
-│  Linux Server   │                                  │ Profile install (~12KB)
-│  (FastAPI API)  │ ────► misagent & Lockdown proxy ─┘
+```text
+┌─────────────────┐       wi-fi / sstp vpn      ┌───────────────────────────────┐
+│                 │ ◄─────────────────────────► │          ios device           │
+│                 │   (tcp 62078 / netmuxd)     │       (ios 16+ / apps)        │
+│                 │                             └───────────────────────────────┘
+│                 │                                             ▲
+│  linux server   │                                             │ profile payload (~12 kb)
+│  (server_api)   │ ────► misagent over lockdown protocol ──────┘
 │                 │
-│                 │ ◄───► Apple Developer Portal (via Sideloader & Anisette)
+│                 │ ◄───► apple developer portal (apple_portal + anisette)
 │                 │
-│                 │ ◄───► Telegram Assistant Bot
+│                 │ ◄───► telegram assistant bot (tg_bot)
 └─────────────────┘
 ```
 
-- **`server_api.py`**: High-performance FastAPI server providing the REST API, PWA interface, lockdown connection pool, and `zsign` signing pipeline.
-- **`tg_bot.py`**: Telegram bot built with asynchronous HTTP polling for status queries, renewal triggers, and expiration warnings.
-- **`netmuxd`**: Network multiplexer handling usbmuxd communication with iOS devices over Bonjour/mDNS (`_apple-mobdev2._tcp.local`).
-- **`sideloader`**: Apple Developer Portal client for managing Developer certificates, registering device UDIDs, and downloading renewed provisioning profiles.
+- **`server_api.py`**: fastapi daemon providing the web dashboard, rest api, ip detection, lockdown proxy pool, and background watcher loop.
+- **`apple_client.py`**: bridge module for downloading fresh provisioning profiles from the apple developer portal using cached session tokens.
+- **`apple_portal/`**: pure-python apple gsa authentication and developer session client.
+- **`login_2fa.py`**: interactive two-factor authentication helper.
+- **`tg_bot.py`**: asynchronous telegram bot polling for status commands, expiration alerts, and manual renewal requests.
+- **`netmuxd`**: usbmuxd multiplexer connecting network-attached ios devices over mDNS and direct tcp.
 
 ---
 
-## 🚀 Getting Started
+## getting started
 
-### 1. Prerequisites
-- **Linux Machine** (Ubuntu / Debian / Raspberry Pi)
-- **Python 3.10+**
-- **Anisette v3 service** running locally (e.g., Docker container on port `6970` or `6969`)
-- **iOS Device** paired with the host machine (`libimobiledevice` / `usbmuxd`)
+### 1. prerequisites
 
-### 2. Clone & Setup
+- linux host (ubuntu, debian, raspberry pi)
+- python 3.10+
+- local anisette server (e.g., docker on port `6970` or `6969`)
+- paired ios device (`libimobiledevice` / `usbmuxd`)
+- `zsign` binary for initial ipa signing
+
+### 2. installation
 
 ```bash
 git clone https://github.com/bourdoune/ios-sideload-server.git
@@ -79,37 +73,50 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configuration
+### 3. configuration
 
-Create your environment configuration from the template:
+copy the environment template:
 
 ```bash
 cp .env.example .env
 chmod 600 .env
 ```
 
-Edit `.env` with your parameters:
+configure [.env](file:///home/bourdoune/misc/root/files/altserver/.env) with your credentials:
 
 ```ini
-# Apple Developer Credentials
+# apple developer credentials
 DEVICE_UDID=00008000-0000000000000000
 APPLE_ID=your_apple_id@example.com
-APPLE_PASS=your_apple_account_password
+APPLE_PASS=your_apple_password
 TEAM_ID=XXXXXXXXXX
 ALTSERVER_ANISETTE_SERVER=http://127.0.0.1:6970
 
-# Telegram Bot (Optional but recommended)
-BOT_TOKEN=1234567890:ABCdefGHIjklMNOpqrSTUvwxYZ
+# telegram bot (optional)
+BOT_TOKEN=1234567890:abcdefghijklmnopqrstuvwxyz
 TG_CHAT_ID=123456789
 ```
 
 ---
 
-## 🖥️ Running as System Services
+## apple authentication and session initialization
 
-Create systemd services for continuous background execution.
+when first configuring the server, or whenever session credentials expire, run the interactive 2fa runner:
 
-#### Sideload Server (`/etc/systemd/system/ios-sideload-server.service`):
+```bash
+venv/bin/python login_2fa.py
+```
+
+the helper initiates grandslam authentication and waits up to 5 minutes for a 6-digit code in `/tmp/2fa_code`. upon verification, developer session tokens are written to `~/.local/share/altserver-apple/session/` and automatic profile renewals are enabled.
+
+---
+
+## systemd services
+
+create systemd unit files for background operation.
+
+### sideload server (`/etc/systemd/system/ios-sideload-server.service`):
+
 ```ini
 [Unit]
 Description=iOS Sideload & Refresh Webhook Server
@@ -117,9 +124,9 @@ After=network.target
 
 [Service]
 Type=simple
-User=your_user
-WorkingDirectory=/path/to/ios-sideload-server
-ExecStart=/path/to/ios-sideload-server/venv/bin/python server_api.py
+User=bourdoune
+WorkingDirectory=/home/bourdoune/misc/root/files/altserver
+ExecStart=/home/bourdoune/misc/root/files/altserver/venv/bin/python server_api.py
 Restart=always
 RestartSec=5
 
@@ -127,7 +134,8 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-#### Telegram Bot (`/etc/systemd/system/ios-sideload-tgbot.service`):
+### telegram bot (`/etc/systemd/system/ios-sideload-tgbot.service`):
+
 ```ini
 [Unit]
 Description=iOS Sideload Telegram Helper Bot
@@ -136,9 +144,9 @@ Wants=ios-sideload-server.service
 
 [Service]
 Type=simple
-User=your_user
-WorkingDirectory=/path/to/ios-sideload-server
-ExecStart=/path/to/ios-sideload-server/venv/bin/python tg_bot.py
+User=bourdoune
+WorkingDirectory=/home/bourdoune/misc/root/files/altserver
+ExecStart=/home/bourdoune/misc/root/files/altserver/venv/bin/python tg_bot.py
 Restart=always
 RestartSec=5
 
@@ -146,7 +154,8 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-Enable and start both services:
+enable and start services:
+
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now ios-sideload-server ios-sideload-tgbot
@@ -154,43 +163,26 @@ sudo systemctl enable --now ios-sideload-server ios-sideload-tgbot
 
 ---
 
-## ⏰ Automated 12-Hour Renewal (Cron)
+## tests
 
-To ensure your apps never expire even if you never open the dashboard, add an automated background renewal job:
+run the test suite using `pytest`:
 
 ```bash
-crontab -e
+PYTHONPATH=. venv/bin/pytest tests/
 ```
-
-Add the following rule:
-```cron
-0 */12 * * * curl -s -X POST http://127.0.0.1:8899/api/refresh > /dev/null 2>&1
-```
-
-Whenever your device is connected to your home network, the certificates will renew silently.
 
 ---
 
-## 🔒 Security & Privacy
+## security and data protection
 
-- **No Stored Credentials in Git**: All sensitive credentials, certificates, provisioning profiles, and pair records are ignored by [`.gitignore`](.gitignore).
-- **Local Network Only**: By default, the service operates entirely within your local LAN. Remote access can be achieved securely through an encrypted VPN (WireGuard / SSTP / Tailscale).
+- all secrets, private keys, device pair records (`*.plist`), provisioning profiles, and sessions are excluded via [.gitignore](file:///home/bourdoune/misc/root/files/altserver/.gitignore).
+- apple session files are isolated under `~/.local/share/altserver-apple` and restricted to user-only read/write (`0700`).
+- remote access can be routed through wireguard, sstp, or tailscale vpn interfaces without exposing internal endpoints to the public internet.
 
 ---
 
-## 📄 License
+## license
 
-This project is licensed under the MIT License.
+licensed under the mit license.
 
-### Apple login and automatic renewal
-
-Run `venv/bin/python login_2fa.py` when Apple verification is required. The helper
-waits up to five minutes for a six-digit code in `/tmp/2fa_code`, verifies the
-configured team, and saves a developer session privately under
-`~/.local/share/altserver-apple`. A failed login leaves automatic Apple requests
-paused; it does not retry or request more codes.
-
-Profile renewal uses the saved session through `apple_client.py`. It leaves app
-IPAs and signing certificates unchanged. The authentication implementation is
-adapted from MIT-licensed [iPASide v1.2.8](https://github.com/pwnapplehat/iPASide/releases/tag/v1.2.8);
-see `apple_portal/LICENSE` and `apple_portal/README.md`.
+the apple portal authentication implementation (`apple_portal/`) is adapted from [iPASide v1.2.8](https://github.com/pwnapplehat/iPASide/releases/tag/v1.2.8); see [apple_portal/LICENSE](file:///home/bourdoune/misc/root/files/altserver/apple_portal/LICENSE) and [apple_portal/README.md](file:///home/bourdoune/misc/root/files/altserver/apple_portal/README.md).
