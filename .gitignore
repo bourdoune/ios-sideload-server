@@ -9,6 +9,7 @@ env/
 # Environment and secrets
 .env
 *.pem
+!apple_portal/certs/apple_gsa_ca.pem
 *.key
 *.p12
 *.cer
@@ -30,6 +31,9 @@ sideloader
 zsign
 netmuxd
 *.so
+*.orig
+*.bak
+sideloader_shim.c
 
 # Runtime data & logs
 tg_config.json
@@ -38,3 +42,9 @@ tg_config.json
 .DS_Store
 static/icons/
 context.md
+.pytest_cache/
+
+.apple_auth_required
+
+.apple_login.lock
+

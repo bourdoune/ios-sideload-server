@@ -10,6 +10,8 @@ import struct
 import time
 import threading
 import gc
+from apple_client import download_profile as download_apple_profile
+from apple_portal.gsa import GsaError
 from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
@@ -43,25 +45,6 @@ DEFAULT_APP_IPA = os.path.join(BASE_DIR, "app.ipa")
 _SIDELOADER_LOCK = threading.Lock()
 AUTO_REFRESH_THRESHOLD_HOURS = 120.0  # Renew if < 5 days (120 hours) left
 
-def ensure_sideloader_device_config():
-    """Ensure ~/.config/Sideloader/device.json uses clean clientInfo without Xcode suffix to prevent HTTP 503 from Apple."""
-    conf_dir = os.path.expanduser("~/.config/Sideloader")
-    dev_path = os.path.join(conf_dir, "device.json")
-    if os.path.exists(dev_path):
-        try:
-            import json as _json
-            with open(dev_path, "r") as f:
-                d = _json.load(f)
-            ci = d.get("clientInfo", "")
-            if "com.apple.dt.Xcode" in ci or not ci:
-                d["clientInfo"] = "<MacBookPro13,2> <macOS;13.1;22C65> <com.apple.AuthKit/1>"
-                tmp_path = dev_path + ".tmp"
-                with open(tmp_path, "w") as f:
-                    _json.dump(d, f)
-                os.replace(tmp_path, dev_path)
-        except Exception as e:
-            print(f"Error sanitizing device.json: {e}")
-ensure_sideloader_device_config()
 
 os.makedirs(PROFILES_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
@@ -165,10 +148,36 @@ def extract_and_save_app_icon(ipa_path: str, bundle_id: str) -> Optional[str]:
     return None
 APPS_CACHE_TTL = 30.0  # 30 seconds cache for snappy updates
 
+def find_active_device_ip() -> Optional[str]:
+    """Auto-detect active iPhone IP across recent Wi-Fi and SSTP VPN leases."""
+    global LAST_KNOWN_IP
+    candidates = []
+    if LAST_KNOWN_IP and not is_local_or_docker(LAST_KNOWN_IP):
+        candidates.append(LAST_KNOWN_IP)
+    for cand in ["172.16.3.34", "172.16.3.33", "192.168.1.83", "192.168.1.59"]:
+        if cand not in candidates:
+            candidates.append(cand)
+    for ip in candidates:
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.35)
+            ret = s.connect_ex((ip, 62078))
+            s.close()
+            if ret == 0:
+                if ip != LAST_KNOWN_IP:
+                    LAST_KNOWN_IP = ip
+                    save_last_known_ip(ip)
+                    register_device_to_netmuxd(ip)
+                return ip
+        except Exception:
+            pass
+    return None
+
 def is_device_alive(ip: str) -> bool:
     """Check if device is reachable via TCP 62078 (Apple lockdown service) or ICMP ping."""
     if not ip or is_local_or_docker(ip):
-        return False
+        active = find_active_device_ip()
+        return bool(active)
     # 1. Direct TCP probe to Apple lockdown port 62078 (works across Wi-Fi and VPN)
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -179,7 +188,11 @@ def is_device_alive(ip: str) -> bool:
             return True
     except Exception:
         pass
-    # 2. Fallback to ICMP ping (works on home Wi-Fi)
+    # 2. Check candidate IPs if target is temporarily unresponsive
+    active = find_active_device_ip()
+    if active:
+        return True
+    # 3. Fallback to ICMP ping (works on home Wi-Fi)
     try:
         res = subprocess.run(["ping", "-c", "1", "-W", "1", ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return res.returncode == 0
@@ -240,10 +253,14 @@ def register_device_to_netmuxd(ip: str):
 async def get_lockdown_client():
     """Connect to iPhone directly over TCP or via netmuxd with auto-retry."""
     # 1. Try direct TCP connection first if IP is known (works great on SSTP VPN and LAN)
-    if LAST_KNOWN_IP and not is_local_or_docker(LAST_KNOWN_IP):
+    target_ip = LAST_KNOWN_IP
+    if not target_ip or not is_device_alive(target_ip):
+        target_ip = find_active_device_ip() or LAST_KNOWN_IP
+
+    if target_ip and not is_local_or_docker(target_ip):
         try:
             return await asyncio.wait_for(
-                create_using_tcp(hostname=LAST_KNOWN_IP, identifier=DEVICE_UDID or None),
+                create_using_tcp(hostname=target_ip, identifier=DEVICE_UDID or None),
                 timeout=3.5
             )
         except Exception:
@@ -344,7 +361,8 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
             exp_str = existing_exp.strftime("%b %d, %H:%M")
             return prov_path, False, f"Profile is already active until {exp_str} UTC ({days}d {hours}h left)."
 
-    ensure_sideloader_device_config()
+    if os.path.exists(os.path.join(BASE_DIR, ".apple_auth_required")):
+        return (prov_path if os.path.exists(prov_path) else None), False, "Apple login needs interactive verification; automatic login is paused."
 
     if app_name == "App" and os.path.exists(prov_path):
         try:
@@ -365,42 +383,30 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
         if parts:
             app_name = parts[-1].capitalize()
 
-    env = os.environ.copy()
-    env["HOME"] = os.path.expanduser("~")
-    env["ALTSERVER_ANISETTE_SERVER"] = os.getenv("ALTSERVER_ANISETTE_SERVER", "http://127.0.0.1:6970")
-    env["APPLE_ID"] = APPLE_ID
-    env["APPLE_PASS"] = APPLE_PASS
-    env["APPLE_PASSWORD"] = APPLE_PASS
-    if os.path.exists(SIDELOADER_SHIM_SO):
-        env["LD_PRELOAD"] = SIDELOADER_SHIM_SO
-
-    auth_input = f"{APPLE_ID}\n"
-
+    downloaded = False
+    err_reason = "Could not download fresh profile from Apple."
     with _SIDELOADER_LOCK:
-        cmd_dl = [SIDELOADER_BIN, "app-id", "download", "-i", "--team", TEAM_ID, "-o", tmp_dl_path, registered_id]
         try:
-            res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=40)
-        except subprocess.TimeoutExpired:
-            res_dl = subprocess.CompletedProcess(cmd_dl, -1, stdout="", stderr="Timeout downloading profile")
+            data = download_apple_profile(TEAM_ID, registered_id, app_name)
+            with open(tmp_dl_path, "wb") as stream:
+                stream.write(data)
+            downloaded = True
+        except GsaError:
+            # No password-based login or 2FA requests are allowed in background jobs.
+            with open(os.path.join(BASE_DIR, ".apple_auth_required"), "w") as marker:
+                marker.write("Interactive Apple verification required.\n")
+            err_reason = "Apple login needs interactive verification; automatic login is paused."
+        except Exception as exc:
+            # Keep the error useful without logging tokens or response payloads.
+            err_reason = f"Apple profile download failed ({type(exc).__name__})."
 
-        out_dl = (res_dl.stdout or "") + (res_dl.stderr or "")
-        # Only try 'app-id add' if the app ID was not found / unregistered, NOT on 503, rate-limits, or timeouts
-        is_transient_error = "503" in out_dl or "rate limit" in out_dl.lower() or res_dl.returncode == -11
-        if (res_dl.returncode != 0 or not os.path.exists(tmp_dl_path)) and not is_transient_error:
-            cmd_add = [SIDELOADER_BIN, "app-id", "add", "-i", "--team", TEAM_ID, app_name, registered_id]
-            try:
-                subprocess.run(cmd_add, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=25)
-                res_dl = subprocess.run(cmd_dl, cwd=BASE_DIR, env=env, input=auth_input, capture_output=True, text=True, timeout=25)
-            except subprocess.TimeoutExpired:
-                pass
-
-    if res_dl.returncode == 0 and os.path.exists(tmp_dl_path) and os.path.getsize(tmp_dl_path) > 0:
+    if downloaded:
         new_exp = extract_profile_expiration(tmp_dl_path)
         if new_exp:
-            if not existing_exp or new_exp >= existing_exp or force:
+            if not existing_exp or new_exp >= existing_exp:
                 shutil.move(tmp_dl_path, prov_path)
                 exp_str = new_exp.strftime("%b %d, %H:%M")
-                return prov_path, True, f"Renewed until {exp_str} UTC (7 days renewed)!"
+                return prov_path, True, f"Renewed until {exp_str} UTC."
             else:
                 try:
                     os.remove(tmp_dl_path)
@@ -418,12 +424,6 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
             os.remove(tmp_dl_path)
         except Exception:
             pass
-
-    out_err = (res_dl.stdout or "") + (res_dl.stderr or "")
-    if "503" in out_err or res_dl.returncode == -11:
-        err_reason = "Apple Developer service temporarily busy (HTTP 503 / rate limit)."
-    else:
-        err_reason = "Could not download fresh profile from Apple."
 
     if existing_exp and os.path.exists(prov_path):
         now = datetime.now(timezone.utc)

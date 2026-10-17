@@ -181,3 +181,16 @@ Whenever your device is connected to your home network, the certificates will re
 ## 📄 License
 
 This project is licensed under the MIT License.
+
+### Apple login and automatic renewal
+
+Run `venv/bin/python login_2fa.py` when Apple verification is required. The helper
+waits up to five minutes for a six-digit code in `/tmp/2fa_code`, verifies the
+configured team, and saves a developer session privately under
+`~/.local/share/altserver-apple`. A failed login leaves automatic Apple requests
+paused; it does not retry or request more codes.
+
+Profile renewal uses the saved session through `apple_client.py`. It leaves app
+IPAs and signing certificates unchanged. The authentication implementation is
+adapted from MIT-licensed [iPASide v1.2.8](https://github.com/pwnapplehat/iPASide/releases/tag/v1.2.8);
+see `apple_portal/LICENSE` and `apple_portal/README.md`.
