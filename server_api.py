@@ -11,6 +11,7 @@ import time
 import threading
 import gc
 from apple_client import download_profile as download_apple_profile
+from apple_portal.developer import DeveloperServicesError
 from apple_portal.gsa import GsaError
 from datetime import datetime, timezone
 from fastapi import FastAPI, UploadFile, File, Form, Request
@@ -396,6 +397,13 @@ def fetch_fresh_provisioning_profile_from_apple(bundle_id: str, app_name: str = 
             with open(os.path.join(BASE_DIR, ".apple_auth_required"), "w") as marker:
                 marker.write("Interactive Apple verification required.\n")
             err_reason = "Apple login needs interactive verification; automatic login is paused."
+        except DeveloperServicesError as exc:
+            if exc.is_session_expired:
+                with open(os.path.join(BASE_DIR, ".apple_auth_required"), "w") as marker:
+                    marker.write("Apple developer session expired; interactive verification required.\n")
+                err_reason = "Apple session expired; automatic login is paused until re-verified."
+            else:
+                err_reason = f"Apple developer error ({exc})."
         except Exception as exc:
             # Keep the error useful without logging tokens or response payloads.
             err_reason = f"Apple profile download failed ({type(exc).__name__})."

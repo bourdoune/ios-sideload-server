@@ -110,3 +110,44 @@ def test_no_second_factor_goes_straight_to_the_tokens(
     assert gsa.begin_login("me@example.com", "pw") == {"status": "authenticated"}
     assert login_flow.events == ["finalize"]
     assert login_flow.pending is None
+
+
+def test_silent_relogin_never_triggers_2fa(
+    monkeypatch: pytest.MonkeyPatch, login_flow: _Calls
+) -> None:
+    _sign_in_returns(monkeypatch, "trustedDeviceSecondaryAuth")
+    with pytest.raises(gsa.GsaError):
+        gsa.silent_relogin("me@example.com", "pw")
+    assert login_flow.events == []
+    assert login_flow.pending is None
+
+
+def test_silent_relogin_succeeds_without_second_factor(
+    monkeypatch: pytest.MonkeyPatch, login_flow: _Calls
+) -> None:
+    _sign_in_returns(monkeypatch, None)
+    monkeypatch.setattr(gsa, "load_session", lambda email=None: {"adsid": "A1", "auth_token": "NEW", "email": email})
+    session = gsa.silent_relogin("me@example.com", "pw")
+    assert session["auth_token"] == "NEW"
+    assert login_flow.events == ["finalize"]
+
+
+def test_refresh_app_token_persists_sk_and_cookie(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    monkeypatch.setattr(gsa.paths, "data_dir", lambda: tmp_path)
+    monkeypatch.setattr(gsa.anisette, "get_headers", lambda: {"X-Apple-I-MD": "x"})
+    spd = {"adsid": "A1", "GsIdmsToken": "IDMS", "sk": b"\x01\x02\x03", "c": b"cookie-bytes"}
+    gsa._save_account("me@example.com", spd, {"token": "OLD", "expiry": 100})
+
+    captured: dict[str, Any] = {}
+
+    def fake_fetch(arg_spd, headers):
+        captured.update(arg_spd)
+        return {"token": "FRESH", "expiry": 200}
+
+    monkeypatch.setattr(gsa, "_fetch_app_token", fake_fetch)
+    refreshed = gsa.refresh_app_token()
+    assert refreshed["auth_token"] == "FRESH"
+    assert captured["c"] == b"cookie-bytes"
+    assert gsa._coerce_bytes(captured["sk"]) == b"\x01\x02\x03"

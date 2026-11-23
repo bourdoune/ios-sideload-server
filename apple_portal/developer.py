@@ -34,6 +34,17 @@ _TIMEOUT = 30
 class DeveloperServicesError(EngineError):
     """Raised when developerservices2 returns a non-zero result code."""
 
+    def __init__(self, message: str, code: Any = None) -> None:
+        super().__init__(message)
+        self.code = code
+
+    @property
+    def is_session_expired(self) -> bool:
+        if self.code is not None and str(self.code) == "1100":
+            return True
+        text = str(self).lower()
+        return text.startswith("1100:") or "session has expired" in text
+
 
 def _headers(session: dict[str, Any], anisette_headers: dict[str, str]) -> dict[str, str]:
     headers = {
@@ -79,7 +90,7 @@ def _request(
     result_code = result.get("resultCode")
     if result_code not in (0, None, "0"):
         message = result.get("userString") or result.get("resultString") or "unknown error"
-        raise DeveloperServicesError(f"{result_code}: {message}")
+        raise DeveloperServicesError(f"{result_code}: {message}", code=result_code)
     return result
 
 

@@ -80,6 +80,7 @@ _GSA_CLIENT_TOKEN = "com.apple.akd/1.0"
 #: Apple refuses with ``-22411`` / ``hsc 401``.
 _HSC_CODE_ALREADY_SENT = 409
 SECONDARY_CODE_ALREADY_SENT = "codeAlreadySent"
+_EC_NEWER_MAC_REQUIRED = -23782
 #: ``au == "repair"`` means the account has no second factor set up; it is not a challenge.
 _AU_NO_SECOND_FACTOR = "repair"
 
@@ -290,7 +291,7 @@ def _gs_request(params: dict[str, Any], headers: dict[str, str]) -> dict[str, An
     req_headers = {
         "Content-Type": "text/x-xml-plist",
         "Accept": "*/*",
-        "User-Agent": _GS_USER_AGENT,
+        "User-Agent": anisette.gsa_user_agent() or _GS_USER_AGENT,
         "X-MMe-Client-Info": _gsa_client_info(headers.get("X-MMe-Client-Info", "")),
     }
     resp = _gsa_http(
@@ -301,6 +302,11 @@ def _gs_request(params: dict[str, Any], headers: dict[str, str]) -> dict[str, An
     )
     _trace(f"GsService2/{params.get('o', '?')}", resp)
     return _parse_gs_response(resp)
+
+
+def _init_ec(response: dict[str, Any]) -> Any:
+    status = response.get("Status", response)
+    return status.get("ec", 0) if isinstance(status, dict) else 0
 
 
 def _check(response: dict[str, Any]) -> None:
@@ -366,9 +372,13 @@ def _authenticate_once(
     usr = srp.User(email, b"", hash_alg=srp.SHA256, ng_type=srp.NG_2048)
     _, a_pub = usr.start_authentication()
 
-    init = _gs_request(
-        {"A2k": a_pub, "ps": ["s2k", "s2k_fo"], "u": email, "o": "init"}, headers
-    )
+    init_params = {"A2k": a_pub, "ps": ["s2k", "s2k_fo"], "u": email, "o": "init"}
+    init = _gs_request(init_params, headers)
+    if _init_ec(init) == _EC_NEWER_MAC_REQUIRED and anisette.use_newer_mac_identity():
+        fresh = anisette.get_headers()
+        headers.clear()
+        headers.update(fresh)
+        init = _gs_request(init_params, headers)
     _check(init)
 
     protocol = init.get("sp", "s2k")
@@ -684,6 +694,29 @@ def _active_email() -> str | None:
     return None
 
 
+def _encode_cookie(value: Any) -> tuple[str | None, str | None]:
+    """Serialize GSA ``c`` cookie without losing bytes vs str type."""
+    if isinstance(value, bytes):
+        return None, base64.b64encode(value).decode("ascii")
+    if isinstance(value, str):
+        return value, None
+    return None, None
+
+
+def _decode_cookie(data: dict[str, Any]) -> Any:
+    if data.get("c_b64"):
+        return base64.b64decode(data["c_b64"])
+    return data.get("c")
+
+
+def _encode_sk(value: Any) -> str | None:
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    if isinstance(value, str):
+        return value
+    return None
+
+
 def _save_account(email: str, spd: dict[str, Any], app_token: dict[str, Any]) -> None:
     path = paths.account_file(email)
     existing: dict[str, Any] = {}
@@ -693,21 +726,30 @@ def _save_account(email: str, spd: dict[str, Any], app_token: dict[str, Any]) ->
         except ValueError:
             existing = {}
 
-    path.write_text(
-        json.dumps(
-            {
-                # team_id is learned later, by provisioning; carry it across a
-                # re-login so refreshing an app can still find its account.
-                **{k: v for k, v in existing.items() if k == "team_id"},
-                "email": email,
-                "adsid": spd.get("adsid"),
-                "GsIdmsToken": spd.get("GsIdmsToken"),
-                "auth_token": app_token.get("token"),
-                "auth_token_expiry": app_token.get("expiry"),
-            }
-        ),
-        encoding="utf-8",
-    )
+    sk_b64 = _encode_sk(spd.get("sk")) or existing.get("sk_b64")
+    c_str, c_b64 = _encode_cookie(spd.get("c"))
+    if c_str is None and c_b64 is None:
+        c_str = existing.get("c")
+        c_b64 = existing.get("c_b64")
+
+    payload: dict[str, Any] = {
+        # team_id is learned later, by provisioning; carry it across a
+        # re-login so refreshing an app can still find its account.
+        **{k: v for k, v in existing.items() if k == "team_id"},
+        "email": email,
+        "adsid": spd.get("adsid"),
+        "GsIdmsToken": spd.get("GsIdmsToken"),
+        "auth_token": app_token.get("token"),
+        "auth_token_expiry": app_token.get("expiry"),
+    }
+    if sk_b64:
+        payload["sk_b64"] = sk_b64
+    if c_b64 is not None:
+        payload["c_b64"] = c_b64
+    elif c_str is not None:
+        payload["c"] = c_str
+
+    path.write_text(json.dumps(payload), encoding="utf-8")
     _set_active(email)
 
 
@@ -840,6 +882,52 @@ def load_session(email: str | None = None) -> dict[str, Any]:
         "auth_token": data["auth_token"],
         "email": data.get("email"),
     }
+
+
+def refresh_app_token(email: str | None = None) -> dict[str, Any]:
+    """Re-mint the scoped Xcode developer token from the cached GSA session.
+
+    Uses the stored ``adsid``, ``GsIdmsToken``, ``sk``, and ``c`` values without
+    sending a password or triggering 2FA.
+    """
+    _migrate_legacy_account()
+    target = email or _acting_as.get() or _active_email()
+    if not target:
+        raise GsaError("not signed in; run 'login' first")
+
+    data = _read_account(target)
+    adsid = data.get("adsid")
+    idms = data.get("GsIdmsToken")
+    sk_b64 = data.get("sk_b64")
+    cookie = _decode_cookie(data)
+    if not (adsid and idms and sk_b64 and cookie is not None):
+        raise GsaError("cached session cannot refresh developer token; sign in again")
+
+    spd = {
+        "adsid": adsid,
+        "GsIdmsToken": idms,
+        "sk": sk_b64,
+        "c": cookie,
+    }
+    app_token = _fetch_app_token(spd, anisette.get_headers())
+    _save_account(data.get("email") or target, spd, app_token)
+    return load_session(data.get("email") or target)
+
+
+def silent_relogin(email: str, password: str) -> dict[str, Any]:
+    """Attempt one non-interactive SRP login using the trusted anisette identity.
+
+    Succeeds only when Apple grants tokens without a second factor. Never
+    triggers a trusted-device or SMS 2FA challenge.
+    """
+    headers = anisette.get_headers()
+    spd, secondary = _authenticate_once(email, password, headers)
+    if secondary:
+        if secondary == SECONDARY_CODE_ALREADY_SENT:
+            _save_pending(email, spd["adsid"], spd["GsIdmsToken"], "trusteddevice")
+        raise GsaError(f"interactive 2FA verification required ({secondary})")
+    _finalize_session(email, spd, headers)
+    return load_session(email)
 
 
 # --------------------------------------------------------------------------- #
